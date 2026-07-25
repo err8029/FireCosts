@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: fire-analysis
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: FIRMS_MAP_KEY
+        sync: false
+      - key: MPLCONFIGDIR
+        value: /tmp/matplotlib
+      - key: PYTHON_VERSION
+        value: 3.11.9

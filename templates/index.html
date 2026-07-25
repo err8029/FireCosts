@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Fire &amp; Burnt Area Analysis</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
+</head>
+<body>
+  <div id="sidebar">
+    <h1>Fire &amp; Burnt Area Analysis</h1>
+    <p class="hint">Draw a box on the map, set a date range, then run the analysis.</p>
+
+    <label>Date
+      <input type="date" id="date-input">
+    </label>
+
+    <label>Days to include (1&ndash;10)
+      <input type="number" id="days-input" min="1" max="10" value="1">
+    </label>
+
+    <label>Fire sensor
+      <select id="source-input">
+        <option value="VIIRS_SNPP_NRT" selected>VIIRS (S-NPP, ~375m)</option>
+        <option value="VIIRS_NOAA20_NRT">VIIRS (NOAA-20, ~375m)</option>
+        <option value="VIIRS_NOAA21_NRT">VIIRS (NOAA-21, ~375m)</option>
+        <option value="MODIS_NRT">MODIS (~1km)</option>
+      </select>
+    </label>
+
+    <button id="draw-box-btn">Draw analysis box</button>
+    <button id="analyze-btn" disabled>Run analysis</button>
+
+    <div id="status"></div>
+
+    <div id="results" class="hidden">
+      <h2>Results</h2>
+      <div class="stat"><span id="stat-fires">0</span> active fire detections</div>
+      <div class="stat"><span id="stat-area">0</span> km&sup2; estimated burnt area</div>
+      <div class="stat"><span id="stat-buildings-total">0</span> buildings in area</div>
+      <div class="stat highlight"><span id="stat-buildings-affected">0</span> buildings estimated affected</div>
+
+      <label>Fallback price (&euro;/m&sup2;)
+        <input type="number" id="price-input" min="0" step="50" value="2700">
+      </label>
+      <button id="valuation-btn" disabled>Estimate value lost (Spain)</button>
+      <div id="valuation-results" class="hidden">
+        <div class="stat highlight"><span id="stat-value-lost">0</span> &euro; estimated value lost</div>
+        <div class="stat"><span id="stat-value-matched">0</span> / <span id="stat-value-priced">0</span> buildings matched to Catastro</div>
+        <div class="stat" id="stat-value-errored-row" style="display:none;">
+          <span id="stat-value-errored">0</span> buildings could not be checked (Catastro request errors) &mdash; try again?
+        </div>
+        <div class="stat" id="stat-value-rate-limited-row" style="display:none;">
+          <span id="stat-value-rate-limited">0</span> buildings skipped &mdash; Catastro's hourly request quota was exceeded. Wait a while, or analyze a smaller area.
+        </div>
+      </div>
+
+      <button id="report-btn" disabled>Export report (PNG)</button>
+    </div>
+
+    <p class="disclaimer">
+      Burnt area is a rough proxy built by buffering active-fire detections,
+      not an official burn-perimeter product. Building counts are estimates,
+      not a substitute for official damage assessments. Value-lost estimates
+      use real building areas from Spain's public Catastro service crossed
+      with an assumed price per m&sup2; (editable above) &mdash; Catastro
+      does not expose official assessed values to the public, and this is
+      not a substitute for a real appraisal. Only works for locations in
+      Spain; buildings without a cadastral match fall back to their OSM
+      footprint area at the fallback price.
+    </p>
+  </div>
+
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  <script src="{{ url_for('static', filename='js/map.js') }}"></script>
+</body>
+</html>
