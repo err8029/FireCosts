@@ -9,9 +9,22 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
 </head>
 <body>
-  <div id="sidebar">
-    <h1>Fire &amp; Burnt Area Analysis</h1>
-    <p class="hint">Draw a box on the map, set a date range, then run the analysis.</p>
+  <div id="toast" role="status" aria-live="polite" class="hidden"></div>
+
+  <header id="app-header">
+    <button id="sidebar-toggle" aria-label="Toggle menu" aria-expanded="true" aria-controls="sidebar">&#9776;</button>
+    <span class="app-title">Fire &amp; Burnt Area Analysis</span>
+    <div id="header-actions">
+      <button id="draw-box-btn">Draw box</button>
+      <button id="analyze-btn" disabled>Analyze</button>
+    </div>
+  </header>
+
+  <div id="app-body">
+    <div id="sidebar-backdrop"></div>
+
+    <div id="sidebar">
+    <p class="hint">Set a date range and sensor below, then use "Draw box" and "Analyze" in the header.</p>
 
     <label>Date
       <input type="date" id="date-input">
@@ -29,11 +42,6 @@
         <option value="MODIS_NRT">MODIS (~1km)</option>
       </select>
     </label>
-
-    <button id="draw-box-btn">Draw analysis box</button>
-    <button id="analyze-btn" disabled>Run analysis</button>
-
-    <div id="status"></div>
 
     <div id="results" class="hidden">
       <h2>Results</h2>
@@ -69,11 +77,12 @@
       does not expose official assessed values to the public, and this is
       not a substitute for a real appraisal. Only works for locations in
       Spain; buildings without a cadastral match fall back to their OSM
-      footprint area at the fallback price.
+      footprint area (&times; floor count, when OSM has it) at the fallback price.
     </p>
-  </div>
+    </div>
 
-  <div id="map"></div>
+    <div id="map"></div>
+  </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>

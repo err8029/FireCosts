@@ -12,6 +12,7 @@ Two independently-cropped figures avoids that.
 """
 import io
 import math
+import unicodedata
 
 import matplotlib
 matplotlib.use("Agg")
@@ -24,7 +25,7 @@ from matplotlib.colors import LinearSegmentedColormap, Normalize
 from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.collections import PatchCollection
 from matplotlib.lines import Line2D
-from shapely.geometry import shape
+from shapely.geometry import box, shape
 
 from services import basemap as basemap_service
 from services import estimate as estimate_service
@@ -49,10 +50,11 @@ def _polygon_patches(geometry):
         yield MplPolygon(polygon[0], closed=True)
 
 
-def _add_osm_basemap(ax, bbox):
-    """Fetch and draw an OSM tile basemap behind everything else. Returns
-    True if a basemap was drawn, so the caller can render attribution."""
-    result = basemap_service.fetch_basemap(bbox)
+def _add_basemap(ax, bbox, layer):
+    """Fetch and draw a tile basemap (OSM or satellite) behind everything
+    else. Returns True if a basemap was drawn, so the caller can render
+    the matching attribution."""
+    result = basemap_service.fetch_basemap(bbox, layer=layer)
     if not result:
         return False
     mosaic, (west, east, south, north) = result
@@ -61,12 +63,48 @@ def _add_osm_basemap(ax, bbox):
     return True
 
 
-def _add_municipality_boundaries(ax, municipalities, bbox, max_labels=15):
+def _normalize_name(name):
+    """Case/accent-insensitive key for matching a municipality name from
+    OSM (mixed case, e.g. "San Martín de Valdeiglesias") against the same
+    place as it appears in the value-lost breakdown (Catastro's municipio
+    name, which comes back upper-case, e.g. "SAN MARTIN DE VALDEIGLESIAS")."""
+    if not name:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", name)
+    stripped = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return stripped.strip().lower()
+
+
+def _top_municipality_names(valuation, limit=5):
+    """Normalized names of the top `limit` municipalities by value lost, or
+    None if there's no valuation to rank by (caller should show all)."""
+    if not valuation or not valuation.get("by_municipality"):
+        return None
+    return {_normalize_name(m["municipality"]) for m in valuation["by_municipality"][:limit]}
+
+
+def _add_municipality_boundaries(ax, municipalities, bbox, top_names=None, max_count=15):
+    """Draw municipality boundary outlines. If top_names is given (from
+    _top_municipality_names), only municipalities in that set are drawn --
+    keeps the map to the handful that actually matter instead of every
+    municipality Overpass returns for the bbox, which in rural areas can be
+    a lot of mostly-irrelevant slivers.
+
+    Returns (drawn: bool, label_candidates: [(name, x, y), ...]). Label text
+    is *not* drawn here -- the caller places it after the legend exists, so
+    it can steer labels away from overlapping the legend box.
+    """
     if not municipalities:
-        return False
-    west, south, east, north = bbox
+        return False, []
+
+    if top_names is not None:
+        municipalities = [m for m in municipalities if _normalize_name(m["name"]) in top_names]
+
+    view_box = box(*bbox)
     drawn = False
-    for muni in municipalities[:max_labels]:
+    label_candidates = []
+    for muni in municipalities[:max_count]:
+        geom = shape(muni["geometry"])
         patches = list(_polygon_patches(muni["geometry"]))
         for patch in patches:
             patch.set_facecolor("none")
@@ -77,17 +115,34 @@ def _add_municipality_boundaries(ax, municipalities, bbox, max_labels=15):
             ax.add_patch(patch)
             drawn = True
 
-        label_point = shape(muni["geometry"]).representative_point()
-        if west <= label_point.x <= east and south <= label_point.y <= north:
-            text = ax.text(
-                label_point.x, label_point.y, muni["name"], fontsize=8,
-                fontweight="bold", color="#6a3d9a", ha="center", va="center", zorder=6,
-            )
-            text.set_path_effects([
-                path_effects.Stroke(linewidth=2.5, foreground="white"),
-                path_effects.Normal(),
-            ])
-    return drawn
+        # A municipality's own representative_point() can land anywhere in
+        # its (possibly huge, rural) full extent -- often well outside a
+        # tightly-cropped map even though the boundary itself passes
+        # through the visible area. Use the point inside *both* the
+        # municipality and the visible bbox instead, so a label only gets
+        # skipped when the municipality truly isn't visible at all.
+        visible_part = geom.intersection(view_box)
+        if visible_part.is_empty:
+            continue
+        label_point = visible_part.representative_point()
+        label_candidates.append((muni["name"], label_point.x, label_point.y))
+
+    return drawn, label_candidates
+
+
+def _draw_municipality_labels(ax, label_candidates):
+    """Draw the deferred municipality name labels. (No longer needs to dodge
+    the legend -- that now renders in its own box below the map instead of
+    on top of it.)"""
+    for name, x, y in label_candidates:
+        text = ax.text(
+            x, y, name, fontsize=8, fontweight="bold", color="#6a3d9a",
+            ha="center", va="center", zorder=6,
+        )
+        text.set_path_effects([
+            path_effects.Stroke(linewidth=2.5, foreground="white"),
+            path_effects.Normal(),
+        ])
 
 
 def _add_burnt_area(ax, burnt_area_geojson):
@@ -266,9 +321,12 @@ def _render_map_figure(fires, burnt_area, affected_buildings, valuation, municip
     fig.subplots_adjust(top=0.86)
     ax = fig.add_subplot(111)
 
-    has_basemap = _add_osm_basemap(ax, meta["bbox"])
+    has_basemap = _add_basemap(ax, meta["bbox"], meta.get("basemap", "osm"))
     _add_burnt_area(ax, burnt_area)
-    has_boundaries = _add_municipality_boundaries(ax, municipalities, meta["bbox"])
+    top_names = _top_municipality_names(valuation)
+    has_boundaries, muni_label_candidates = _add_municipality_boundaries(
+        ax, municipalities, meta["bbox"], top_names=top_names,
+    )
 
     value_by_osm_id = {b["osm_id"]: b["value_eur"] for b in valuation["buildings"]} if valuation else {}
     fire_values = None
@@ -301,8 +359,9 @@ def _render_map_figure(fires, burnt_area, affected_buildings, valuation, municip
     _add_scale_bar(ax, mean_lat)
 
     if has_basemap:
+        attribution_text = basemap_service.get_attribution(meta.get("basemap", "osm"))
         attribution = ax.text(
-            0.99, 0.01, basemap_service.ATTRIBUTION, transform=ax.transAxes, fontsize=6,
+            0.99, 0.01, attribution_text, transform=ax.transAxes, fontsize=6,
             ha="right", va="bottom", color="#333333", zorder=10,
         )
         attribution.set_bbox(dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1.5))
@@ -341,12 +400,32 @@ def _render_map_figure(fires, burnt_area, affected_buildings, valuation, municip
             Line2D([0], [0], color="#6a3d9a", linestyle="--", linewidth=1.3,
                    label="Municipality boundary (OSM)")
         )
-    ax.legend(handles=legend_handles, loc="upper right", fontsize=8, framealpha=0.9)
-
     if collection is not None:
         cbar = fig.colorbar(collection, ax=ax, fraction=0.035, pad=0.02)
         cbar.set_label("Estimated value (€)", fontsize=8)
 
+    # No legend drawn on the map itself -- it renders in its own box below
+    # the map instead (see _render_legend_figure), so labels never have to
+    # dodge it.
+    _draw_municipality_labels(ax, muni_label_candidates)
+
+    return fig, legend_handles
+
+
+def _render_legend_figure(legend_handles):
+    """Render the map's legend as its own bordered box below the map,
+    instead of overlaid on top of it -- so it never covers map content
+    (fires, buildings, municipality labels)."""
+    ncol = min(len(legend_handles), 3)
+    n_rows = math.ceil(len(legend_handles) / ncol)
+
+    fig = plt.figure(figsize=(10, 0.55 * n_rows + 0.35))
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+    ax.legend(
+        handles=legend_handles, loc="center", ncol=ncol, fontsize=9,
+        frameon=True, framealpha=1, edgecolor="#888888", borderpad=1.2,
+    )
     return fig
 
 
@@ -388,7 +467,7 @@ def _render_footer_figure():
     footer = (
         "Burnt area is a proxy built by buffering active-fire detections, not an official burn "
         "perimeter. Value estimates combine real Catastro built areas (Spain only) or OSM "
-        "footprints with an assumed price/m² -- not an official appraisal."
+        "footprints (x floor count, when available) with an assumed price/m² -- not an official appraisal."
     )
     fig = plt.figure(figsize=(10, 0.5))
     ax = fig.add_subplot(111)
@@ -407,13 +486,15 @@ def render_report_png(fires, burnt_area, affected_buildings, valuation, municipa
     municipalities: list of {"name", "geometry"} from services.municipalities, or None
     meta: dict with title info -- bbox, date, days, source
     """
-    map_arr = _fig_to_array(_render_map_figure(
+    map_fig, legend_handles = _render_map_figure(
         fires, burnt_area, affected_buildings, valuation, municipalities, meta
-    ))
+    )
+    map_arr = _fig_to_array(map_fig)
+    legend_arr = _fig_to_array(_render_legend_figure(legend_handles))
     table_arr = _fig_to_array(_render_table_figure(valuation))
     footer_arr = _fig_to_array(_render_footer_figure())
 
-    combined = _vstack([map_arr, table_arr, footer_arr])
+    combined = _vstack([map_arr, legend_arr, table_arr, footer_arr])
 
     buf = io.BytesIO()
     mpimg.imsave(buf, combined, format="png")

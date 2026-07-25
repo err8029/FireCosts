@@ -11,14 +11,30 @@ import math
 
 import numpy as np
 import requests
-from matplotlib import image as mpimg
+from PIL import Image
 
-_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 _HEADERS = {"User-Agent": "FireAnalysis/1.0 (personal project; contact: n/a)"}
 _TILE_SIZE = 256
 _MAX_TILES = 36
 
-ATTRIBUTION = "© OpenStreetMap contributors"
+# Esri World Imagery is a free, no-key-required satellite/aerial tile
+# service (same light-use expectations as OSM's tile policy: manual,
+# occasional requests with attribution, not high-traffic embedding). Its
+# REST tile path is ordered {z}/{y}/{x}, not the usual {z}/{x}/{y}.
+_LAYERS = {
+    "osm": {
+        "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "attribution": "© OpenStreetMap contributors",
+    },
+    "satellite": {
+        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "attribution": "Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+    },
+}
+
+
+def get_attribution(layer):
+    return _LAYERS.get(layer, _LAYERS["osm"])["attribution"]
 
 
 def _deg2num(lat, lon, zoom):
@@ -45,9 +61,13 @@ def _pick_zoom(west, south, east, north, target_tiles_across):
     return 3
 
 
-def fetch_basemap(bbox, target_tiles_across=4, timeout=10):
+def fetch_basemap(bbox, layer="osm", target_tiles_across=4, timeout=10):
     """Return (mosaic_rgba_array, (west, east, south, north)) for a stitched
-    OSM basemap covering bbox, or None if no tiles could be fetched."""
+    basemap covering bbox, or None if no tiles could be fetched.
+
+    layer: "osm" or "satellite" -- see _LAYERS above.
+    """
+    tile_url = _LAYERS.get(layer, _LAYERS["osm"])["url"]
     west, south, east, north = bbox
     zoom = _pick_zoom(west, south, east, north, target_tiles_across)
 
@@ -68,14 +88,16 @@ def fetch_basemap(bbox, target_tiles_across=4, timeout=10):
     for ty in range(y_min, y_max + 1):
         for tx in range(x_min, x_max + 1):
             try:
-                resp = session.get(_TILE_URL.format(z=zoom, x=tx, y=ty), timeout=timeout)
+                resp = session.get(tile_url.format(z=zoom, x=tx, y=ty), timeout=timeout)
                 resp.raise_for_status()
-                tile = mpimg.imread(io.BytesIO(resp.content))
+                # PIL sniffs the actual format from the file signature, unlike
+                # matplotlib's imread which -- given a BytesIO with no
+                # filename to infer an extension from -- assumes PNG and
+                # chokes on JPEG tiles (e.g. Esri's satellite imagery).
+                img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+                tile = np.asarray(img, dtype=np.float32) / 255.0
             except Exception:
                 continue
-            if tile.shape[2] == 3:
-                alpha = np.ones((*tile.shape[:2], 1), dtype=tile.dtype)
-                tile = np.concatenate([tile, alpha], axis=2)
             row_off = (ty - y_min) * _TILE_SIZE
             col_off = (tx - x_min) * _TILE_SIZE
             mosaic[row_off:row_off + _TILE_SIZE, col_off:col_off + _TILE_SIZE] = tile

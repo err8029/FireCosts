@@ -3,6 +3,8 @@ import logging
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request, Response
+from shapely.geometry import shape
+from shapely.ops import unary_union
 from werkzeug.exceptions import HTTPException
 
 from services import buildings as buildings_service
@@ -141,7 +143,23 @@ def api_valuation():
     except (TypeError, ValueError):
         return jsonify({"error": "'default_price_per_m2' must be a number"}), 400
 
-    result = valuation_service.estimate_value_lost(buildings, default_price)
+    # Real municipality boundaries give a much better "municipality" label
+    # for buildings that fall back to the OSM-estimate path (no Catastro
+    # match) than OSM's addr:city tag, which most buildings don't have set.
+    # Best-effort: if Overpass is unavailable/rate-limited, valuation still
+    # proceeds, just without this extra classification.
+    municipalities = []
+    try:
+        geoms = [shape(f["geometry"]) for f in buildings["features"]]
+        west, south, east, north = unary_union(geoms).bounds
+        pad = 0.01
+        municipalities = municipalities_service.fetch_municipality_boundaries(
+            (west - pad, south - pad, east + pad, north + pad)
+        )
+    except Exception:
+        logger.warning("Municipality boundary lookup failed for valuation", exc_info=True)
+
+    result = valuation_service.estimate_value_lost(buildings, default_price, municipalities=municipalities)
     return jsonify(result)
 
 

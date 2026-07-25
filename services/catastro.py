@@ -14,6 +14,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from services import catastro_cache
+
 _COORD_URL = "http://ovc.catastro.meh.es/ovcservweb/OVCSWLocalizacionRC/OVCCoordenadas.asmx/Consulta_RCCOOR"
 _DETAIL_URL = "http://ovc.catastro.meh.es/ovcservweb/OVCSWLocalizacionRC/OVCCallejero.asmx/Consulta_DNPRC"
 
@@ -75,7 +77,23 @@ def _raise_for_status(resp):
 
 def lookup_reference(lon, lat, timeout=10):
     """Return (cadastral_reference, address) for a point, or (None, None) if
-    no cadastral parcel exists there (street, park, outside Spain, ...)."""
+    no cadastral parcel exists there (street, park, outside Spain, ...).
+
+    Cached on disk (see services/catastro_cache.py) -- both a real
+    reference and a confirmed "nothing here" are stable facts worth not
+    re-spending the hourly request quota on. A rate-limit error is *not*
+    cached, since it's transient and says nothing about this location.
+    """
+    cached = catastro_cache.get_reference(lon, lat)
+    if cached is not catastro_cache.MISS:
+        return cached
+
+    result = _lookup_reference_live(lon, lat, timeout)
+    catastro_cache.set_reference(lon, lat, result[0], result[1])
+    return result
+
+
+def _lookup_reference_live(lon, lat, timeout):
     params = {"SRS": "EPSG:4326", "Coordenada_X": lon, "Coordenada_Y": lat}
     resp = _session.get(_COORD_URL, params=params, timeout=timeout)
     _raise_for_status(resp)
@@ -126,7 +144,20 @@ def lookup_details(rc, timeout=10):
     A bare 14-character parcel reference can resolve to several distinct
     buildings/units on that parcel; in that case each is looked up by its
     full reference and their built areas are combined.
+
+    Cached on disk keyed by rc (see services/catastro_cache.py) -- same
+    reasoning as lookup_reference above.
     """
+    cached = catastro_cache.get_details(rc)
+    if cached is not catastro_cache.MISS:
+        return cached
+
+    result = _lookup_details_live(rc, timeout)
+    catastro_cache.set_details(rc, result)
+    return result
+
+
+def _lookup_details_live(rc, timeout):
     data = _fetch_dnp(rc, timeout)
 
     bico = data.get("bico")

@@ -79,6 +79,7 @@ def fetch_buildings(bbox, timeout=60):
                 "addr_housenumber": tags.get("addr:housenumber"),
                 "addr_street": tags.get("addr:street"),
                 "addr_city": tags.get("addr:city") or tags.get("addr:town") or tags.get("addr:village"),
+                "building_levels": tags.get("building:levels"),
             },
         })
 

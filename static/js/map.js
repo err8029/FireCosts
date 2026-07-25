@@ -1,9 +1,28 @@
 const map = L.map("map").setView([40.4168, -3.7038], 11); // default: Madrid
 
-L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+const osmLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 19,
   attribution: "&copy; OpenStreetMap contributors",
-}).addTo(map);
+});
+
+// Esri World Imagery: free, no API key required, same light-use
+// expectations as OSM's tile policy.
+const satelliteLayer = L.tileLayer(
+  "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+  {
+    maxZoom: 19,
+    attribution:
+      "Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+  }
+);
+
+osmLayer.addTo(map);
+L.control.layers({ "OpenStreetMap": osmLayer, "Satellite": satelliteLayer }).addTo(map);
+
+let currentBasemap = "osm";
+map.on("baselayerchange", (e) => {
+  currentBasemap = e.name === "Satellite" ? "satellite" : "osm";
+});
 
 const drawnItems = new L.FeatureGroup();
 map.addLayer(drawnItems);
@@ -32,7 +51,10 @@ let lastAnalysis = null;
 let lastValuation = null;
 let lastMeta = null;
 
-const statusEl = document.getElementById("status");
+const toastEl = document.getElementById("toast");
+const sidebarEl = document.getElementById("sidebar");
+const sidebarBackdrop = document.getElementById("sidebar-backdrop");
+const sidebarToggleBtn = document.getElementById("sidebar-toggle");
 const analyzeBtn = document.getElementById("analyze-btn");
 const drawBoxBtn = document.getElementById("draw-box-btn");
 const dateInput = document.getElementById("date-input");
@@ -45,6 +67,22 @@ const valuationResultsEl = document.getElementById("valuation-results");
 const reportBtn = document.getElementById("report-btn");
 
 dateInput.value = new Date().toISOString().slice(0, 10);
+
+function setSidebarOpen(open) {
+  sidebarEl.classList.toggle("open", open);
+  sidebarBackdrop.classList.toggle("visible", open);
+  sidebarToggleBtn.setAttribute("aria-expanded", String(open));
+}
+
+// Start open on desktop-sized screens (controls visible immediately), and
+// collapsed on phones/small tablets so the map gets the full viewport.
+setSidebarOpen(window.innerWidth > 768);
+
+sidebarToggleBtn.addEventListener("click", () => {
+  setSidebarOpen(!sidebarEl.classList.contains("open"));
+});
+
+sidebarBackdrop.addEventListener("click", () => setSidebarOpen(false));
 
 drawBoxBtn.addEventListener("click", () => {
   drawnItems.clearLayers();
@@ -67,8 +105,13 @@ map.on(L.Draw.Event.CREATED, (e) => {
 });
 
 function setStatus(msg, isError) {
-  statusEl.textContent = msg;
-  statusEl.style.color = isError ? "#ff6b6b" : "#f2c94c";
+  if (!msg) {
+    toastEl.classList.add("hidden");
+    return;
+  }
+  toastEl.textContent = msg;
+  toastEl.classList.toggle("error", !!isError);
+  toastEl.classList.remove("hidden");
 }
 
 async function parseJsonResponse(resp) {
@@ -269,7 +312,7 @@ async function exportReport() {
         burnt_area: lastAnalysis.burnt_area,
         affected_buildings: lastAnalysis.affected_buildings,
         valuation: lastValuation,
-        meta: lastMeta,
+        meta: { ...lastMeta, basemap: currentBasemap },
       }),
     });
 
