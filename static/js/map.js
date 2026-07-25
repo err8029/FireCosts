@@ -71,6 +71,20 @@ function setStatus(msg, isError) {
   statusEl.style.color = isError ? "#ff6b6b" : "#f2c94c";
 }
 
+async function parseJsonResponse(resp) {
+  const text = await resp.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Not JSON -- e.g. a gateway/proxy error page, or a server crash that
+    // slipped past our own JSON error handler. Surface something readable
+    // instead of the raw parse error.
+    throw new Error(
+      `Server returned an unexpected response (HTTP ${resp.status}). It may be temporarily unavailable -- try again in a moment.`
+    );
+  }
+}
+
 function clearResultLayers() {
   [fireLayer, burntAreaLayer, buildingsLayer].forEach((layer) => {
     if (layer) map.removeLayer(layer);
@@ -101,7 +115,7 @@ async function runAnalysis() {
 
   try {
     const resp = await fetch(`/api/estimate?${params.toString()}`);
-    const data = await resp.json();
+    const data = await parseJsonResponse(resp);
 
     if (!resp.ok) {
       throw new Error(data.error || `Request failed (${resp.status})`);
@@ -178,7 +192,7 @@ async function runValuation() {
         default_price_per_m2: Number(priceInput.value) || undefined,
       }),
     });
-    const data = await resp.json();
+    const data = await parseJsonResponse(resp);
 
     if (!resp.ok) {
       throw new Error(data.error || `Request failed (${resp.status})`);

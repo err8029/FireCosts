@@ -1,7 +1,9 @@
 import datetime as dt
+import logging
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request, Response
+from werkzeug.exceptions import HTTPException
 
 from services import buildings as buildings_service
 from services import estimate as estimate_service
@@ -13,6 +15,24 @@ from services import valuation as valuation_service
 load_dotenv()
 
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
+
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(exc):
+    return jsonify({"error": exc.description}), exc.code
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_exception(exc):
+    # Every /api/* route is called by fetch() expecting JSON. Without this,
+    # an unhandled exception (e.g. Overpass/FIRMS/Catastro timing out with
+    # something other than the specific error types we catch below) falls
+    # through to Flask's default HTML error page, which breaks the frontend
+    # with "Unexpected token '<' ... is not valid JSON" instead of a
+    # readable message.
+    logger.exception("Unhandled exception in %s", request.path)
+    return jsonify({"error": f"Unexpected server error: {exc}"}), 500
 
 
 def _parse_bbox(args):
