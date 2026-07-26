@@ -13,7 +13,7 @@ import numpy as np
 import requests
 from PIL import Image
 
-_HEADERS = {"User-Agent": "FireAnalysis/1.0 (personal project; contact: n/a)"}
+_HEADERS = {"User-Agent": "Hephaestus/1.0 (personal project; contact: n/a)"}
 _TILE_SIZE = 256
 _MAX_TILES = 36
 

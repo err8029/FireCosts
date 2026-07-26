@@ -40,6 +40,13 @@ body {
   background: #2a2f36;
 }
 
+.app-icon {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border-radius: 6px;
+}
+
 .app-title {
   font-size: 15px;
   font-weight: 600;

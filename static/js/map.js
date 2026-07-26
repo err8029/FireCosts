@@ -91,13 +91,21 @@ const CUSTOM_EXAMPLES_KEY = "fireAnalysisCustomExamples";
 const MAX_RECENT_BOXES = 10;
 
 // Curated starting points -- real-world areas worth exploring without having
-// to know their coordinates offhand. Add more here as {name, lat, lon}; a
-// user can also add their own via "Save current box as example" below,
-// which stores an exact bbox rather than a center point + fixed span.
-const EXAMPLE_BOXES = [];
+// to know their coordinates offhand. Shipped in code (not localStorage) so
+// they show up for every visitor, including on a fresh deploy. Each entry
+// is either an exact {name, bbox: [west, south, east, north]} (e.g. one
+// captured via "Save current box as example…") or a {name, lat, lon}
+// center point, expanded to a fixed-size box below.
+const EXAMPLE_BOXES = [
+  {
+    name: "Eastern Madrid Fire",
+    bbox: [-4.963760375976563, 40.19041398364302, -4.137725830078126, 40.51745320894507],
+  },
+];
 const EXAMPLE_BOX_HALF_SPAN_DEG = 0.15;
 
 function exampleBboxFor(entry) {
+  if (entry.bbox) return entry.bbox;
   const { lat, lon } = entry;
   return [
     lon - EXAMPLE_BOX_HALF_SPAN_DEG,
@@ -148,7 +156,9 @@ function populateBoxesDropdown(selectedValue) {
     EXAMPLE_BOXES.forEach((entry, i) => {
       const opt = document.createElement("option");
       opt.value = `example:${i}`;
-      opt.textContent = `${entry.name} (${entry.lat.toFixed(3)}, ${entry.lon.toFixed(3)})`;
+      opt.textContent = entry.lat != null
+        ? `${entry.name} (${entry.lat.toFixed(3)}, ${entry.lon.toFixed(3)})`
+        : entry.name;
       exampleGroup.appendChild(opt);
     });
     customExamples.forEach((entry, i) => {
@@ -481,7 +491,7 @@ async function exportReport() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `fire_report_${lastMeta.date}.png`;
+    a.download = `hephaestus_report_${lastMeta.date}.png`;
     document.body.appendChild(a);
     a.click();
     a.remove();

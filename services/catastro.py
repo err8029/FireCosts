@@ -24,7 +24,7 @@ _DETAIL_URL = "http://ovc.catastro.meh.es/ovcservweb/OVCSWLocalizacionRC/OVCCall
 # or resetting connections. Retry transient failures with backoff instead of
 # treating them the same as "no cadastral data at this location".
 _session = requests.Session()
-_session.headers.update({"User-Agent": "FireAnalysis/1.0 (personal project; contact: n/a)"})
+_session.headers.update({"User-Agent": "Hephaestus/1.0 (personal project; contact: n/a)"})
 _retry = Retry(
     total=3, backoff_factor=0.5,
     status_forcelist=[429, 500, 502, 503, 504],

@@ -18,7 +18,7 @@ _ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
 ]
-_HEADERS = {"User-Agent": "FireAnalysis/1.0 (personal project; contact: n/a)"}
+_HEADERS = {"User-Agent": "Hephaestus/1.0 (personal project; contact: n/a)"}
 
 _session = requests.Session()
 _session.headers.update(_HEADERS)

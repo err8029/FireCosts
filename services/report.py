@@ -189,6 +189,84 @@ def _draw_municipality_labels(ax, label_candidates):
         ])
 
 
+def _mainland_bounds(geom):
+    """Bounds of a geometry's largest polygon by area, not its overall
+    MultiPolygon bbox -- Spain's admin boundary includes the Canary
+    Islands, ~1000km southwest of the mainland, so the raw bbox would be
+    dominated by that gap and make the mainland (and the region within it)
+    a speck when used to set a zoom extent. Returns None for an empty
+    geometry."""
+    if geom.is_empty:
+        return None
+    if geom.geom_type == "MultiPolygon":
+        geom = max(geom.geoms, key=lambda g: g.area)
+    return geom.bounds
+
+
+def _add_locator_inset(ax, country, region, analysis_bbox):
+    """Zoomed-out inset in the map's top-right corner: the country (faint
+    background context) and the containing region (Comunidad Autonoma --
+    geometrically the same boundary as its NUTS2 statistical region)
+    highlighted, with the analysis box's location marked, so a viewer
+    unfamiliar with the exact area can see where it sits. Skipped entirely
+    if no region was found (e.g. bbox isn't in Spain, or Overpass was
+    unavailable).
+
+    Zoomed to fit the country's mainland (see _mainland_bounds) when
+    available, so the country's actual outline/coastline is visible rather
+    than just a flat fill color -- falling back to a wide margin around
+    just the region if there's no country geometry to work with.
+    """
+    if not region:
+        return
+
+    inset = ax.inset_axes([0.66, 0.66, 0.32, 0.32])
+    inset.set_facecolor("#f5f5f0")
+    inset.set_zorder(20)
+
+    country_bounds = None
+    if country:
+        for patch in _polygon_patches(country["geometry"]):
+            patch.set_facecolor("#e8e4d8")
+            patch.set_edgecolor("#999999")
+            patch.set_linewidth(0.5)
+            inset.add_patch(patch)
+        country_bounds = _mainland_bounds(shape(country["geometry"]))
+
+    region_geom = shape(region["geometry"])
+    for patch in _polygon_patches(region["geometry"]):
+        patch.set_facecolor("#d8b8c8")
+        patch.set_edgecolor("#555555")
+        patch.set_linewidth(1.0)
+        inset.add_patch(patch)
+
+    west, south, east, north = analysis_bbox
+    center_x, center_y = (west + east) / 2, (south + north) / 2
+    inset.scatter(
+        [center_x], [center_y], marker="*", s=110, color="#e31a1c",
+        edgecolors="#7a0000", linewidths=0.6, zorder=5,
+    )
+
+    if country_bounds:
+        minx, miny, maxx, maxy = country_bounds
+        pad_frac = 0.06
+    else:
+        minx, miny, maxx, maxy = region_geom.bounds
+        pad_frac = 1.0  # no country outline to lean on -- zoom out further around just the region
+    pad_x = (maxx - minx) * pad_frac or 0.1
+    pad_y = (maxy - miny) * pad_frac or 0.1
+    inset.set_xlim(minx - pad_x, maxx + pad_x)
+    inset.set_ylim(miny - pad_y, maxy + pad_y)
+    inset.set_aspect(1 / max(math.cos(math.radians((miny + maxy) / 2)), 0.15))
+    inset.set_xticks([])
+    inset.set_yticks([])
+    for spine in inset.spines.values():
+        spine.set_edgecolor("#555555")
+        spine.set_linewidth(0.8)
+
+    inset.set_title(region.get("name", ""), fontsize=6, pad=2)
+
+
 def _add_burnt_area(ax, burnt_area_geojson):
     if not burnt_area_geojson:
         return
@@ -372,7 +450,7 @@ def _vstack(arrays, gaps=24):
     return np.concatenate(parts, axis=0)
 
 
-def _render_map_figure(fires, burnt_area, affected_buildings, valuation, municipalities, meta):
+def _render_map_figure(fires, burnt_area, affected_buildings, valuation, municipalities, country, region, meta):
     west, south, east, north = meta["bbox"]
     mean_lat = (south + north) / 2
     lon_span_m = (east - west) * _M_PER_DEG_LAT * max(math.cos(math.radians(mean_lat)), 0.15)
@@ -409,8 +487,11 @@ def _render_map_figure(fires, burnt_area, affected_buildings, valuation, municip
     fires_mappable = _add_fires(ax, fires, fire_values, norm)
     collection = buildings_mappable or fires_mappable
 
-    pad_x = (east - west) * 0.05 or 0.001
-    pad_y = (north - south) * 0.05 or 0.001
+    # Wider than a purely cosmetic margin would need: the extra room keeps
+    # the locator inset (top-right corner) from sitting on top of real fire
+    # detections or buildings that would otherwise extend into that corner.
+    pad_x = (east - west) * 0.18 or 0.001
+    pad_y = (north - south) * 0.18 or 0.001
     ax.set_xlim(west - pad_x, east + pad_x)
     ax.set_ylim(south - pad_y, north + pad_y)
     ax.set_aspect(1 / max(math.cos(math.radians(mean_lat)), 0.15))
@@ -420,6 +501,7 @@ def _render_map_figure(fires, burnt_area, affected_buildings, valuation, municip
         spine.set_visible(True)
         spine.set_color("#888888")
 
+    _add_locator_inset(ax, country, region, meta["bbox"])
     _add_scale_bar(ax, mean_lat)
 
     if has_basemap:
@@ -439,7 +521,7 @@ def _render_map_figure(fires, burnt_area, affected_buildings, valuation, municip
     if valuation:
         subtitle += f" · {_fmt_eur(valuation['total_value_eur'])} estimated value lost"
 
-    fig.suptitle("Fire & Burnt Area Report", fontsize=16, fontweight="bold", x=0.02, ha="left", y=0.97)
+    fig.suptitle("Hephaestus — Fire & Burnt Area Report", fontsize=16, fontweight="bold", x=0.02, ha="left", y=0.97)
     fig.text(0.02, 0.905, subtitle, fontsize=9, color="#555555")
 
     fire_label = "Active fire detection" + (" (colored by value burnt nearby)" if fires_mappable is not None else "")
@@ -506,18 +588,39 @@ def _render_table_figure(valuation):
         return fig
 
     rows = valuation["by_municipality"]
-    row_h = 0.42
-    fig.set_size_inches(10, 1.1 + row_h * (len(rows) + 1))
+    top_n = 15
+    shown_rows = rows[:top_n]
+    remaining_rows = rows[top_n:]
 
     col_labels = ["Municipality / village", "Buildings affected", "Estimated value lost"]
-    cell_text = [[r["municipality"], str(r["buildings"]), _fmt_eur(r["value_eur"])] for r in rows]
+    cell_text = [[r["municipality"], str(r["buildings"]), _fmt_eur(r["value_eur"])] for r in shown_rows]
+
+    others_row_idx = None
+    if remaining_rows:
+        others_row_idx = len(cell_text)
+        cell_text.append([
+            f"Others ({len(remaining_rows)} more)",
+            str(sum(r["buildings"] for r in remaining_rows)),
+            _fmt_eur(sum(r["value_eur"] for r in remaining_rows)),
+        ])
+
     cell_text.append(["TOTAL", str(valuation["buildings_priced"]), _fmt_eur(valuation["total_value_eur"])])
 
-    ax.set_title("Value lost by municipality / village", fontsize=12, fontweight="bold", loc="left")
+    row_h = 0.42
+    fig.set_size_inches(10, 1.1 + row_h * (len(cell_text) + 1))
+
+    title = "Value lost by municipality / village"
+    if remaining_rows:
+        title += f" (top {top_n})"
+    ax.set_title(title, fontsize=12, fontweight="bold", loc="left")
     tbl = ax.table(cellText=cell_text, colLabels=col_labels, loc="upper center", cellLoc="left")
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(9)
     tbl.scale(1, 1.6)
+
+    if others_row_idx is not None:
+        for col in range(3):
+            tbl[others_row_idx + 1, col].set_text_props(style="italic", color="#555555")
 
     n_rows = len(cell_text)
     for col in range(3):
@@ -540,7 +643,7 @@ def _render_footer_figure():
     return fig
 
 
-def render_report_png(fires, burnt_area, affected_buildings, valuation, municipalities, meta):
+def render_report_png(fires, burnt_area, affected_buildings, valuation, municipalities, country, region, meta):
     """Return PNG bytes for the report.
 
     fires: FeatureCollection of active-fire points
@@ -548,12 +651,14 @@ def render_report_png(fires, burnt_area, affected_buildings, valuation, municipa
     affected_buildings: FeatureCollection of affected building footprints
     valuation: result dict from services.valuation.estimate_value_lost, or None
     municipalities: list of {"name", "geometry"} from services.municipalities, or None
+    country, region: {"name", "geometry"} for the locator inset (see
+        services.municipalities.fetch_locator_context), or None to skip it
     meta: dict with title info -- bbox, date, days, source
     """
     valuation = _reclassify_municipalities(valuation, affected_buildings, municipalities)
 
     map_fig, legend_handles = _render_map_figure(
-        fires, burnt_area, affected_buildings, valuation, municipalities, meta
+        fires, burnt_area, affected_buildings, valuation, municipalities, country, region, meta
     )
     # Trimmed (not just zero-padded) so the map's bottom edge and the
     # legend box's top edge sit truly flush with no visible gap.

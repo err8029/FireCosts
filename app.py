@@ -181,6 +181,11 @@ def api_report():
         return jsonify({"error": "Missing/invalid 'meta.bbox'"}), 400
     meta["bbox"] = bbox
     municipalities = municipalities_service.fetch_municipality_boundaries(bbox)
+    try:
+        locator_context = municipalities_service.fetch_locator_context(bbox)
+    except Exception:
+        logger.warning("Locator context lookup failed for report inset", exc_info=True)
+        locator_context = {"country": None, "region": None}
 
     png_bytes = report_service.render_report_png(
         fires=fires,
@@ -188,6 +193,8 @@ def api_report():
         affected_buildings=affected_buildings,
         valuation=payload.get("valuation"),
         municipalities=municipalities,
+        country=locator_context["country"],
+        region=locator_context["region"],
         meta=meta,
     )
 

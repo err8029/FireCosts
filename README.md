@@ -1,8 +1,9 @@
-# Fire & Burnt Area Analysis
+# Hephaestus — Fire & Burnt Area Analysis
 
-A Flask + Leaflet tool for exploring active wildfires, estimating the area
-they've burned, overlaying the buildings in that area, and estimating the
-monetary value at risk — with a one-click PNG report you can save or share.
+Named for the Greek god of fire and the forge, Hephaestus is a Flask +
+Leaflet tool for exploring active wildfires, estimating the area they've
+burned, overlaying the buildings in that area, and estimating the monetary
+value at risk — with a one-click PNG report you can save or share.
 
 ![Example report output](docs/report_example.png)
 
@@ -40,12 +41,14 @@ demonstration.*
 - **Switchable basemap**: OpenStreetMap or Esri World Imagery satellite.
 - **Exportable PNG report**: title, stats, the map (with basemap, burnt
   area, affected buildings colored/sized by estimated value, fire
-  detections colored/sized by value burnt nearby, and the top 5
-  municipality boundaries by value with labels), a legend, and a
-  value-by-municipality table.
+  detections colored/sized by value burnt nearby, the top 5 municipality
+  boundaries by value with labels, and a locator inset showing the
+  containing region and country with the analysis location marked), a
+  legend, and a value-by-municipality table (top 15, with the rest
+  summarized in an "Others" row).
 - **Recent & example boxes**: re-run an analysis on a previously-used box
   from a dropdown, or save any box as a named example — both persisted in
-  your browser.
+  your browser. A couple of curated examples ship with the app itself.
 - Mobile-friendly responsive layout with a collapsible sidebar.
 
 ## Limitations, on purpose
@@ -95,7 +98,7 @@ services/
   firms.py                   NASA FIRMS active-fire fetch
   estimate.py                Burnt-area proxy, affected-building matching, value-per-fire
   buildings.py               OSM building footprints (Overpass)
-  municipalities.py          OSM administrative boundaries (Overpass)
+  municipalities.py          OSM administrative boundaries (municipality, region, country -- Overpass)
   overpass.py                Shared Overpass client (retry + mirror fallback)
   catastro.py                Spain's Catastro web services client
   catastro_cache.py          On-disk cache for Catastro lookups
@@ -105,6 +108,7 @@ services/
 templates/index.html         Page shell
 static/js/map.js             Leaflet map, UI wiring, API calls
 static/css/style.css         Styling
+static/favicon.svg           App icon (browser tab + header)
 ```
 
 ## A note on data sources
