@@ -214,6 +214,20 @@ button#draw-box-btn {
   background: #2b6cb0;
 }
 
+button#save-example-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #ccc;
+  font-weight: 400;
+  font-size: 12px;
+  padding: 6px;
+  margin-top: -4px;
+}
+
+button#save-example-btn:hover {
+  background: #2a2f36;
+}
+
 #toast {
   position: fixed;
   left: 50%;

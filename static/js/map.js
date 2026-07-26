@@ -65,6 +65,8 @@ const priceInput = document.getElementById("price-input");
 const valuationBtn = document.getElementById("valuation-btn");
 const valuationResultsEl = document.getElementById("valuation-results");
 const reportBtn = document.getElementById("report-btn");
+const recentBoxesSelect = document.getElementById("recent-boxes-select");
+const saveExampleBtn = document.getElementById("save-example-btn");
 
 dateInput.value = new Date().toISOString().slice(0, 10);
 
@@ -83,6 +85,159 @@ sidebarToggleBtn.addEventListener("click", () => {
 });
 
 sidebarBackdrop.addEventListener("click", () => setSidebarOpen(false));
+
+const RECENT_BOXES_KEY = "fireAnalysisRecentBoxes";
+const CUSTOM_EXAMPLES_KEY = "fireAnalysisCustomExamples";
+const MAX_RECENT_BOXES = 10;
+
+// Curated starting points -- real-world areas worth exploring without having
+// to know their coordinates offhand. Add more here as {name, lat, lon}; a
+// user can also add their own via "Save current box as example" below,
+// which stores an exact bbox rather than a center point + fixed span.
+const EXAMPLE_BOXES = [];
+const EXAMPLE_BOX_HALF_SPAN_DEG = 0.15;
+
+function exampleBboxFor(entry) {
+  const { lat, lon } = entry;
+  return [
+    lon - EXAMPLE_BOX_HALF_SPAN_DEG,
+    lat - EXAMPLE_BOX_HALF_SPAN_DEG,
+    lon + EXAMPLE_BOX_HALF_SPAN_DEG,
+    lat + EXAMPLE_BOX_HALF_SPAN_DEG,
+  ];
+}
+
+function loadRecentBoxes() {
+  try {
+    return JSON.parse(localStorage.getItem(RECENT_BOXES_KEY)) || [];
+  } catch {
+    return [];
+  }
+}
+
+function loadCustomExamples() {
+  try {
+    return JSON.parse(localStorage.getItem(CUSTOM_EXAMPLES_KEY)) || [];
+  } catch {
+    return [];
+  }
+}
+
+function saveCustomExample(name, bbox) {
+  const examples = loadCustomExamples();
+  examples.push({ name, bbox });
+  localStorage.setItem(CUSTOM_EXAMPLES_KEY, JSON.stringify(examples));
+}
+
+function bboxKey(bbox) {
+  return bbox.map((v) => v.toFixed(5)).join(",");
+}
+
+function populateBoxesDropdown(selectedValue) {
+  recentBoxesSelect.innerHTML = "";
+
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "— select a box —";
+  recentBoxesSelect.appendChild(placeholder);
+
+  const customExamples = loadCustomExamples();
+  if (EXAMPLE_BOXES.length || customExamples.length) {
+    const exampleGroup = document.createElement("optgroup");
+    exampleGroup.label = "Examples";
+    EXAMPLE_BOXES.forEach((entry, i) => {
+      const opt = document.createElement("option");
+      opt.value = `example:${i}`;
+      opt.textContent = `${entry.name} (${entry.lat.toFixed(3)}, ${entry.lon.toFixed(3)})`;
+      exampleGroup.appendChild(opt);
+    });
+    customExamples.forEach((entry, i) => {
+      const opt = document.createElement("option");
+      opt.value = `custom:${i}`;
+      opt.textContent = entry.name;
+      exampleGroup.appendChild(opt);
+    });
+    recentBoxesSelect.appendChild(exampleGroup);
+  }
+
+  const recentBoxes = loadRecentBoxes();
+  if (recentBoxes.length) {
+    const recentGroup = document.createElement("optgroup");
+    recentGroup.label = "Recently used";
+    recentBoxes.forEach((entry) => {
+      const [west, south, east, north] = entry.bbox;
+      const centerLat = (south + north) / 2;
+      const centerLon = (west + east) / 2;
+      const opt = document.createElement("option");
+      opt.value = `recent:${bboxKey(entry.bbox)}`;
+      opt.textContent = `${centerLat.toFixed(3)}, ${centerLon.toFixed(3)} — used ${entry.date}`;
+      recentGroup.appendChild(opt);
+    });
+    recentBoxesSelect.appendChild(recentGroup);
+  }
+
+  const validValues = Array.from(recentBoxesSelect.options).map((o) => o.value);
+  recentBoxesSelect.value = selectedValue && validValues.includes(selectedValue) ? selectedValue : "";
+}
+
+function rememberBbox(bbox, date) {
+  const key = bboxKey(bbox);
+  const boxes = loadRecentBoxes().filter((entry) => bboxKey(entry.bbox) !== key);
+  boxes.unshift({ bbox, date });
+  localStorage.setItem(RECENT_BOXES_KEY, JSON.stringify(boxes.slice(0, MAX_RECENT_BOXES)));
+  populateBoxesDropdown(`recent:${key}`);
+}
+
+function applyBbox(bbox) {
+  const [west, south, east, north] = bbox;
+  currentBbox = bbox;
+
+  drawnItems.clearLayers();
+  const rect = L.rectangle([[south, west], [north, east]], { color: "#2b6cb0" });
+  drawnItems.addLayer(rect);
+  map.fitBounds(rect.getBounds(), { padding: [20, 20] });
+
+  analyzeBtn.disabled = false;
+  setStatus("");
+}
+
+recentBoxesSelect.addEventListener("change", () => {
+  const value = recentBoxesSelect.value;
+  if (!value) return;
+
+  if (value.startsWith("example:")) {
+    const entry = EXAMPLE_BOXES[Number(value.slice("example:".length))];
+    if (entry) applyBbox(exampleBboxFor(entry));
+    return;
+  }
+
+  if (value.startsWith("custom:")) {
+    const entry = loadCustomExamples()[Number(value.slice("custom:".length))];
+    if (entry) applyBbox(entry.bbox);
+    return;
+  }
+
+  if (value.startsWith("recent:")) {
+    const key = value.slice("recent:".length);
+    const entry = loadRecentBoxes().find((e) => bboxKey(e.bbox) === key);
+    if (entry) applyBbox(entry.bbox);
+  }
+});
+
+saveExampleBtn.addEventListener("click", () => {
+  if (!currentBbox) {
+    setStatus("Draw or select a box first.", true);
+    return;
+  }
+  const name = window.prompt("Name this example (e.g. \"Eastern Madrid fire\"):");
+  if (!name || !name.trim()) return;
+
+  saveCustomExample(name.trim(), currentBbox);
+  populateBoxesDropdown(`custom:${loadCustomExamples().length - 1}`);
+  setStatus(`Saved "${name.trim()}" as an example.`);
+});
+
+populateBoxesDropdown();
 
 drawBoxBtn.addEventListener("click", () => {
   drawnItems.clearLayers();
@@ -173,6 +328,7 @@ async function runAnalysis() {
     };
     renderResults(data);
     reportBtn.disabled = false;
+    rememberBbox(currentBbox, dateInput.value);
     setStatus("");
   } catch (err) {
     setStatus(err.message, true);

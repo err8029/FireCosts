@@ -29,6 +29,7 @@ from shapely.geometry import box, shape
 
 from services import basemap as basemap_service
 from services import estimate as estimate_service
+from services import valuation as valuation_service
 
 _M_PER_DEG_LAT = 111_320.0
 
@@ -83,6 +84,50 @@ def _top_municipality_names(valuation, limit=5):
     return {_normalize_name(m["municipality"]) for m in valuation["by_municipality"][:limit]}
 
 
+def _reclassify_municipalities(valuation, affected_buildings, municipalities):
+    """Give buildings stuck in the "Others" bucket a second chance at a real
+    municipality name using the boundaries fetched for *this* report.
+
+    "Estimate value lost" and "Export report" are separate user actions,
+    often minutes apart, each fetching municipality boundaries from
+    Overpass independently. If that fetch failed or was rate-limited during
+    valuation, every building falls back to "Others" with no way to recover
+    short of re-running the estimate -- even though the boundaries needed
+    to classify them might fetch just fine right now, for the report. This
+    re-attempts the same point-in-polygon lookup valuation.py uses, so a
+    transient failure earlier doesn't have to mean "Others" forever.
+    """
+    if not valuation or not municipalities:
+        return valuation
+
+    geom_by_osm_id = {}
+    for feat in (affected_buildings or {}).get("features", []):
+        osm_id = feat.get("properties", {}).get("osm_id")
+        if osm_id is not None:
+            geom_by_osm_id[osm_id] = shape(feat["geometry"])
+
+    updated_buildings = []
+    changed = False
+    for b in valuation["buildings"]:
+        if not b.get("municipality") or b["municipality"] == "Others":
+            geom = geom_by_osm_id.get(b.get("osm_id"))
+            if geom is not None:
+                found = valuation_service.municipality_for_point(geom.centroid, municipalities)
+                if found:
+                    b = {**b, "municipality": found}
+                    changed = True
+        updated_buildings.append(b)
+
+    if not changed:
+        return valuation
+
+    return {
+        **valuation,
+        "buildings": updated_buildings,
+        "by_municipality": valuation_service.group_by_municipality(updated_buildings),
+    }
+
+
 def _add_municipality_boundaries(ax, municipalities, bbox, top_names=None, max_count=15):
     """Draw municipality boundary outlines. If top_names is given (from
     _top_municipality_names), only municipalities in that set are drawn --
@@ -91,8 +136,7 @@ def _add_municipality_boundaries(ax, municipalities, bbox, top_names=None, max_c
     a lot of mostly-irrelevant slivers.
 
     Returns (drawn: bool, label_candidates: [(name, x, y), ...]). Label text
-    is *not* drawn here -- the caller places it after the legend exists, so
-    it can steer labels away from overlapping the legend box.
+    is drawn separately by _draw_municipality_labels.
     """
     if not municipalities:
         return False, []
@@ -275,20 +319,40 @@ def _fmt_eur(value):
     return f"€{value:,.0f}"
 
 
-def _fig_to_array(fig, facecolor="white"):
+def _fig_to_array(fig, facecolor="white", pad_inches=0.1):
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight", facecolor=facecolor)
+    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight", pad_inches=pad_inches, facecolor=facecolor)
     plt.close(fig)
     buf.seek(0)
     return mpimg.imread(buf)
 
 
-def _vstack(arrays, gap_px=24):
+def _trim_vertical_whitespace(arr):
+    """Trim near-white rows from the top and bottom of an image array.
+    matplotlib's bbox_inches="tight" doesn't always hug an aspect-
+    constrained axes exactly, leaving a thin residual margin -- this
+    guarantees a hard, gap-free stack against a neighboring image
+    regardless of that quirk."""
+    is_content_row = (arr[:, :, :3] < 0.98).any(axis=(1, 2))
+    if not is_content_row.any():
+        return arr
+    rows = np.nonzero(is_content_row)[0]
+    return arr[rows[0]:rows[-1] + 1]
+
+
+def _vstack(arrays, gaps=24):
     """Vertically stack RGBA float arrays of possibly-different widths,
-    centering narrower ones on a white background."""
+    centering narrower ones on a white background.
+
+    gaps: either a single gap size (px) applied between every pair, or a
+    list of len(arrays)-1 sizes for per-transition control (e.g. 0 to butt
+    two sections directly together with no visible seam).
+    """
+    if isinstance(gaps, int):
+        gaps = [gaps] * (len(arrays) - 1)
+
     max_w = max(a.shape[1] for a in arrays)
     channels = arrays[0].shape[2]
-    gap = np.ones((gap_px, max_w, channels), dtype=arrays[0].dtype)
 
     def pad(a):
         extra = max_w - a.shape[1]
@@ -303,8 +367,8 @@ def _vstack(arrays, gap_px=24):
     parts = []
     for i, arr in enumerate(arrays):
         parts.append(pad(arr))
-        if i < len(arrays) - 1:
-            parts.append(gap)
+        if i < len(arrays) - 1 and gaps[i] > 0:
+            parts.append(np.ones((gaps[i], max_w, channels), dtype=arrays[0].dtype))
     return np.concatenate(parts, axis=0)
 
 
@@ -486,15 +550,19 @@ def render_report_png(fires, burnt_area, affected_buildings, valuation, municipa
     municipalities: list of {"name", "geometry"} from services.municipalities, or None
     meta: dict with title info -- bbox, date, days, source
     """
+    valuation = _reclassify_municipalities(valuation, affected_buildings, municipalities)
+
     map_fig, legend_handles = _render_map_figure(
         fires, burnt_area, affected_buildings, valuation, municipalities, meta
     )
-    map_arr = _fig_to_array(map_fig)
-    legend_arr = _fig_to_array(_render_legend_figure(legend_handles))
+    # Trimmed (not just zero-padded) so the map's bottom edge and the
+    # legend box's top edge sit truly flush with no visible gap.
+    map_arr = _trim_vertical_whitespace(_fig_to_array(map_fig, pad_inches=0))
+    legend_arr = _trim_vertical_whitespace(_fig_to_array(_render_legend_figure(legend_handles), pad_inches=0))
     table_arr = _fig_to_array(_render_table_figure(valuation))
     footer_arr = _fig_to_array(_render_footer_figure())
 
-    combined = _vstack([map_arr, legend_arr, table_arr, footer_arr])
+    combined = _vstack([map_arr, legend_arr, table_arr, footer_arr], gaps=[0, 24, 24])
 
     buf = io.BytesIO()
     mpimg.imsave(buf, combined, format="png")

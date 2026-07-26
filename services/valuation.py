@@ -81,7 +81,7 @@ def _parse_levels(value):
         return 1.0
 
 
-def _municipality_for_point(point, municipalities):
+def municipality_for_point(point, municipalities):
     """Spatial fallback for municipality name: which fetched admin boundary
     (see services/municipalities.py) contains this point, if any. More
     reliable than OSM's addr:city tag, which most buildings simply don't
@@ -122,7 +122,7 @@ def _lookup_building(feature, default_price, rate_limited_flag, municipalities=N
     props = feature.get("properties", {})
     osm_id = props.get("osm_id")
     centroid = geom.centroid
-    fallback_municipality = _municipality_for_point(centroid, municipalities) or props.get("addr_city")
+    fallback_municipality = municipality_for_point(centroid, municipalities) or props.get("addr_city")
     levels = _parse_levels(props.get("building_levels"))
 
     # Once any request in this batch has hit Catastro's hourly quota, every
@@ -176,7 +176,7 @@ def _lookup_building(feature, default_price, rate_limited_flag, municipalities=N
     }
 
 
-def _group_by_municipality(results):
+def group_by_municipality(results):
     totals = {}
     for r in results:
         name = r["municipality"] or "Others"
@@ -206,5 +206,5 @@ def estimate_value_lost(buildings_geojson, default_price_per_m2=DEFAULT_PRICE_PE
         "buildings_matched_catastro": sum(1 for r in results if r["source"] == "catastro"),
         "buildings_errored": sum(1 for r in results if r["source"] == "catastro_error"),
         "buildings_rate_limited": sum(1 for r in results if r["source"] == "catastro_rate_limited"),
-        "by_municipality": _group_by_municipality(results),
+        "by_municipality": group_by_municipality(results),
     }

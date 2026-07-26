@@ -11,8 +11,7 @@ import requests
 from shapely.geometry import LineString, mapping
 from shapely.ops import polygonize, unary_union
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-_HEADERS = {"User-Agent": "FireAnalysis/1.0 (personal project; contact: n/a)"}
+from services import overpass
 
 
 def fetch_municipality_boundaries(bbox, timeout=30):
@@ -27,10 +26,7 @@ def fetch_municipality_boundaries(bbox, timeout=30):
     out geom;
     """
     try:
-        resp = requests.post(
-            OVERPASS_URL, data={"data": query}, headers=_HEADERS, timeout=timeout + 10
-        )
-        resp.raise_for_status()
+        resp = overpass.query(query, timeout=timeout + 10)
         data = resp.json()
     except requests.RequestException:
         return []

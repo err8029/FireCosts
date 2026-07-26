@@ -3,7 +3,7 @@ convert them to GeoJSON polygons.
 """
 import requests
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+from services import overpass
 
 # Keep bbox area sane so Overpass doesn't time out / rate-limit us.
 _MAX_BBOX_DEG2 = 0.5  # roughly a ~50km x 50km box at mid-latitudes
@@ -46,11 +46,12 @@ def fetch_buildings(bbox, timeout=60):
     out skel qt;
     """
 
-    headers = {"User-Agent": "FireAnalysis/1.0 (github.com/; contact: n/a)"}
-    resp = requests.post(
-        OVERPASS_URL, data={"data": query}, headers=headers, timeout=timeout + 10
-    )
-    resp.raise_for_status()
+    try:
+        resp = overpass.query(query, timeout=timeout + 10)
+    except requests.RequestException as exc:
+        raise BuildingsError(
+            f"Could not fetch OSM buildings right now (Overpass: {exc}). Try again shortly."
+        ) from exc
     data = resp.json()
 
     nodes = {}
