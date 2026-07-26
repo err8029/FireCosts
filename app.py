@@ -50,6 +50,17 @@ def _parse_bbox(args):
         raise ValueError("'bbox' values must be numbers")
     if west >= east or south >= north:
         raise ValueError("'bbox' is invalid: west<east and south<north required")
+
+    # Reject an oversized box immediately, before any slow external call --
+    # otherwise a giant analysis can run long enough to trip the hosting
+    # platform's own gateway timeout, which shows up to the user as an
+    # opaque 502 with no useful explanation.
+    area_deg2 = (east - west) * (north - south)
+    if area_deg2 > buildings_service.MAX_BBOX_DEG2:
+        raise ValueError(
+            "Selected area is too large to analyze (roughly 50km x 50km max). "
+            "Please draw a smaller box."
+        )
     return (west, south, east, north)
 
 
@@ -110,14 +121,29 @@ def api_estimate():
 
     burnt_area, area_km2 = estimate_service.build_burnt_area(fires, source=source)
 
-    try:
-        all_buildings = buildings_service.fetch_buildings(bbox)
-    except buildings_service.BuildingsError as exc:
-        return jsonify({"error": str(exc)}), 400
-
-    affected, total_count, affected_count = estimate_service.buildings_in_burnt_area(
-        all_buildings, burnt_area
-    )
+    if burnt_area is None:
+        # Nothing burning in this box -- no building can be "affected", so
+        # skip the OSM building query entirely instead of fetching every
+        # building in the whole drawn box just to report a count against
+        # zero fires.
+        affected, total_count, affected_count = [], 0, 0
+    else:
+        # Only buildings near the burnt area can ever end up "affected" --
+        # querying just that (small) bounding box instead of the whole
+        # drawn box is what keeps this fast even when the box is large but
+        # the fire itself covers a tiny fraction of it. Small pad (~500m)
+        # comfortably covers a building whose footprint straddles the edge
+        # of the burnt-area bounds even though its centroid falls inside.
+        west, south, east, north = shape(burnt_area).bounds
+        pad = 0.005
+        query_bbox = (west - pad, south - pad, east + pad, north + pad)
+        try:
+            all_buildings = buildings_service.fetch_buildings(query_bbox)
+        except buildings_service.BuildingsError as exc:
+            return jsonify({"error": str(exc)}), 400
+        affected, total_count, affected_count = estimate_service.buildings_in_burnt_area(
+            all_buildings, burnt_area
+        )
 
     return jsonify({
         "fires": fires,

@@ -48,8 +48,15 @@ def fetch_active_fires(bbox, start_date, day_range=1, source="VIIRS_SNPP_NRT"):
     day_range = max(1, min(10, day_range))
 
     url = f"{FIRMS_BASE_URL}/{map_key}/{source}/{area}/{day_range}/{start_date}"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.Timeout as exc:
+        raise FirmsError(
+            "NASA FIRMS did not respond in time. Try a smaller area, fewer days, or try again shortly."
+        ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise FirmsError(f"Could not reach NASA FIRMS ({exc}). Try again shortly.") from exc
 
     text = resp.text.strip()
     if not text or text.lower().startswith("invalid"):

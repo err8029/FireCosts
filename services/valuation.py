@@ -12,6 +12,7 @@ back to their OSM footprint area at a default price.
 import logging
 import math
 import threading
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from shapely.geometry import shape
@@ -176,11 +177,32 @@ def _lookup_building(feature, default_price, rate_limited_flag, municipalities=N
     }
 
 
+def normalize_municipality_name(name):
+    """Case/accent-insensitive key for merging the same place name that
+    shows up differently-cased across sources -- Catastro's municipio
+    field comes back upper-case (e.g. "MADRID"), while OpenStreetMap
+    administrative boundary names use normal case (e.g. "Madrid"), which
+    would otherwise split one city into two rows in the value-lost table."""
+    if not name:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", name)
+    stripped = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return stripped.strip().lower()
+
+
 def group_by_municipality(results):
     totals = {}
     for r in results:
         name = r["municipality"] or "Others"
-        entry = totals.setdefault(name, {"municipality": name, "buildings": 0, "value_eur": 0})
+        key = normalize_municipality_name(name)
+        entry = totals.get(key)
+        if entry is None:
+            totals[key] = {"municipality": name, "buildings": 1, "value_eur": r["value_eur"]}
+            continue
+        # Prefer a properly-cased display name (e.g. "Madrid") over an
+        # ALL-CAPS one (e.g. "MADRID") if both show up for the same place.
+        if entry["municipality"].isupper() and not name.isupper():
+            entry["municipality"] = name
         entry["buildings"] += 1
         entry["value_eur"] += r["value_eur"]
     return sorted(totals.values(), key=lambda e: e["value_eur"], reverse=True)

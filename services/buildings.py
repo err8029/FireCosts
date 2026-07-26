@@ -1,12 +1,28 @@
 """Fetch building footprints from OpenStreetMap via the Overpass API and
 convert them to GeoJSON polygons.
 """
+import threading
+import time
+
 import requests
 
 from services import overpass
 
-# Keep bbox area sane so Overpass doesn't time out / rate-limit us.
-_MAX_BBOX_DEG2 = 0.5  # roughly a ~50km x 50km box at mid-latitudes
+# Keep bbox area sane so Overpass doesn't time out / rate-limit us. Also
+# reused by app.py to reject an oversized box immediately (before any slow
+# external call), rather than let a giant request run long enough to trip
+# the hosting platform's own gateway timeout with an opaque 502.
+MAX_BBOX_DEG2 = 0.5  # roughly a ~50km x 50km box at mid-latitudes
+
+# In-memory cache keyed by (rounded) bbox: re-analyzing the same box -- e.g.
+# via the "recent boxes" shortcut, or just changing the date/day-range and
+# re-running -- is common, and OSM building footprints don't change on that
+# timescale, so there's no reason to re-spend 10-20s re-fetching from
+# Overpass every time. Not persisted (process-lifetime only): fine since
+# the goal is speeding up repeats within a session, not surviving restarts.
+_CACHE_TTL_SECONDS = 20 * 60
+_cache = {}
+_cache_lock = threading.Lock()
 
 
 class BuildingsError(RuntimeError):
@@ -18,6 +34,10 @@ def _bbox_area(bbox):
     return max(0.0, east - west) * max(0.0, north - south)
 
 
+def _cache_key(bbox):
+    return tuple(round(v, 6) for v in bbox)
+
+
 def fetch_buildings(bbox, timeout=60):
     """Fetch OSM building footprints within bbox as a GeoJSON FeatureCollection.
 
@@ -26,11 +46,19 @@ def fetch_buildings(bbox, timeout=60):
     all `building=*` ways/relations in the box are returned so the caller can
     filter further if desired.
     """
-    if _bbox_area(bbox) > _MAX_BBOX_DEG2:
+    if _bbox_area(bbox) > MAX_BBOX_DEG2:
         raise BuildingsError(
             "Selected area is too large for a live OSM building query. "
             "Please zoom in / draw a smaller box."
         )
+
+    key = _cache_key(bbox)
+    with _cache_lock:
+        cached = _cache.get(key)
+    if cached is not None:
+        cached_at, result = cached
+        if time.time() - cached_at <= _CACHE_TTL_SECONDS:
+            return {"type": result["type"], "features": list(result["features"])}
 
     west, south, east, north = bbox
     # Overpass wants (south,west,north,east)
@@ -48,6 +76,11 @@ def fetch_buildings(bbox, timeout=60):
 
     try:
         resp = overpass.query(query, timeout=timeout + 10)
+    except requests.exceptions.Timeout as exc:
+        raise BuildingsError(
+            "OpenStreetMap's building data service (Overpass) did not respond in time. "
+            "Try a smaller area, or try again shortly."
+        ) from exc
     except requests.RequestException as exc:
         raise BuildingsError(
             f"Could not fetch OSM buildings right now (Overpass: {exc}). Try again shortly."
@@ -84,4 +117,7 @@ def fetch_buildings(bbox, timeout=60):
             },
         })
 
-    return {"type": "FeatureCollection", "features": features}
+    result = {"type": "FeatureCollection", "features": features}
+    with _cache_lock:
+        _cache[key] = (time.time(), result)
+    return {"type": result["type"], "features": list(result["features"])}

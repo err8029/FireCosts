@@ -12,7 +12,6 @@ Two independently-cropped figures avoids that.
 """
 import io
 import math
-import unicodedata
 
 import matplotlib
 matplotlib.use("Agg")
@@ -68,12 +67,10 @@ def _normalize_name(name):
     """Case/accent-insensitive key for matching a municipality name from
     OSM (mixed case, e.g. "San Martín de Valdeiglesias") against the same
     place as it appears in the value-lost breakdown (Catastro's municipio
-    name, which comes back upper-case, e.g. "SAN MARTIN DE VALDEIGLESIAS")."""
-    if not name:
-        return ""
-    nfkd = unicodedata.normalize("NFKD", name)
-    stripped = "".join(c for c in nfkd if not unicodedata.combining(c))
-    return stripped.strip().lower()
+    name, which comes back upper-case, e.g. "SAN MARTIN DE VALDEIGLESIAS").
+    Same normalization valuation.py uses to merge differently-cased
+    duplicates in the table -- kept as one shared implementation there."""
+    return valuation_service.normalize_municipality_name(name)
 
 
 def _top_municipality_names(valuation, limit=5):
