@@ -98,7 +98,7 @@ const MAX_RECENT_BOXES = 10;
 // center point, expanded to a fixed-size box below.
 const EXAMPLE_BOXES = [
   {
-    name: "Eastern Madrid Fire",
+    name: "Sierra Oeste Fire",
     bbox: [-4.963760375976563, 40.19041398364302, -4.137725830078126, 40.51745320894507],
   },
 ];
@@ -239,7 +239,7 @@ saveExampleBtn.addEventListener("click", () => {
     setStatus("Draw or select a box first.", true);
     return;
   }
-  const name = window.prompt("Name this example (e.g. \"Eastern Madrid fire\"):");
+  const name = window.prompt("Name this example (e.g. \"Sierra Oeste fire\"):");
   if (!name || !name.trim()) return;
 
   saveCustomExample(name.trim(), currentBbox);
