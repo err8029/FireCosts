@@ -97,6 +97,10 @@ def _reclassify_municipalities(valuation, affected_buildings, municipalities):
     if not valuation or not municipalities:
         return valuation
 
+    # Prepared once up front rather than per building -- see
+    # valuation_service._prepare_municipalities.
+    prepared_municipalities = valuation_service._prepare_municipalities(municipalities)
+
     geom_by_osm_id = {}
     for feat in (affected_buildings or {}).get("features", []):
         osm_id = feat.get("properties", {}).get("osm_id")
@@ -109,7 +113,7 @@ def _reclassify_municipalities(valuation, affected_buildings, municipalities):
         if not b.get("municipality") or b["municipality"] == "Others":
             geom = geom_by_osm_id.get(b.get("osm_id"))
             if geom is not None:
-                found = valuation_service.municipality_for_point(geom.centroid, municipalities)
+                found = valuation_service.municipality_for_point(geom.centroid, prepared_municipalities)
                 if found:
                     b = {**b, "municipality": found}
                     changed = True

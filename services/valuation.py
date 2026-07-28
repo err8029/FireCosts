@@ -16,6 +16,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from shapely.geometry import shape
+from shapely.prepared import prep
 
 from services import catastro
 
@@ -82,20 +83,36 @@ def _parse_levels(value):
         return 1.0
 
 
-def municipality_for_point(point, municipalities):
+def municipality_for_point(point, prepared_municipalities):
     """Spatial fallback for municipality name: which fetched admin boundary
-    (see services/municipalities.py) contains this point, if any. More
-    reliable than OSM's addr:city tag, which most buildings simply don't
-    have set."""
-    if not municipalities:
+    (see services/municipalities.py, pre-shaped by _prepare_municipalities)
+    contains this point, if any. More reliable than OSM's addr:city tag,
+    which most buildings simply don't have set."""
+    if not prepared_municipalities:
         return None
-    for muni in municipalities:
+    for name, prepared_geom in prepared_municipalities:
         try:
-            if shape(muni["geometry"]).contains(point):
-                return muni["name"]
+            if prepared_geom.contains(point):
+                return name
         except Exception:
             continue
     return None
+
+
+def _prepare_municipalities(municipalities):
+    """Pre-shape and prepare each municipality polygon once. Without this,
+    checking N buildings against M municipalities re-parses and re-indexes
+    the same GeoJSON geometry up to N times per municipality -- shapely's
+    prepared geometries exist specifically for this "one geometry, many
+    contains() queries" pattern (the same technique estimate.py already
+    uses for the burnt-area/building intersection check)."""
+    prepared = []
+    for muni in municipalities or []:
+        try:
+            prepared.append((muni["name"], prep(shape(muni["geometry"]))))
+        except Exception:
+            continue
+    return prepared
 
 
 def _fallback_result(osm_id, geom, rc, address, municipality, default_price, levels=1.0, source="osm_footprint_estimate"):
@@ -118,43 +135,50 @@ def _fallback_result(osm_id, geom, rc, address, municipality, default_price, lev
     }
 
 
-def _lookup_building(feature, default_price, rate_limited_flag, municipalities=None):
+def _lookup_building(feature, default_price, rate_limited_flag, prepared_municipalities=None):
     geom = shape(feature["geometry"])
     props = feature.get("properties", {})
     osm_id = props.get("osm_id")
     centroid = geom.centroid
-    fallback_municipality = municipality_for_point(centroid, municipalities) or props.get("addr_city")
     levels = _parse_levels(props.get("building_levels"))
+
+    # The spatial point-in-polygon scan is only needed as a fallback, and
+    # Catastro almost always includes a municipality whenever it has any
+    # match at all -- so this stays a plain function (evaluated only at
+    # whichever single return statement below actually fires) instead of
+    # running unconditionally for every building up front.
+    def fallback_municipality():
+        return municipality_for_point(centroid, prepared_municipalities) or props.get("addr_city")
 
     # Once any request in this batch has hit Catastro's hourly quota, every
     # remaining request would fail the same way -- skip straight to the
     # fallback instead of continuing to hammer an already-blocked service.
     if rate_limited_flag.is_set():
-        return _fallback_result(osm_id, geom, None, None, fallback_municipality, default_price, levels, source="catastro_rate_limited")
+        return _fallback_result(osm_id, geom, None, None, fallback_municipality(), default_price, levels, source="catastro_rate_limited")
 
     try:
         rc, address = catastro.lookup_reference(centroid.x, centroid.y)
     except catastro.CatastroRateLimitError:
         rate_limited_flag.set()
-        return _fallback_result(osm_id, geom, None, None, fallback_municipality, default_price, levels, source="catastro_rate_limited")
+        return _fallback_result(osm_id, geom, None, None, fallback_municipality(), default_price, levels, source="catastro_rate_limited")
     except Exception:
         logger.warning("Catastro lookup_reference failed for osm_id=%s", osm_id, exc_info=True)
-        return _fallback_result(osm_id, geom, None, None, fallback_municipality, default_price, levels, source="catastro_error")
+        return _fallback_result(osm_id, geom, None, None, fallback_municipality(), default_price, levels, source="catastro_error")
 
     if not rc:
-        return _fallback_result(osm_id, geom, None, None, fallback_municipality, default_price, levels)
+        return _fallback_result(osm_id, geom, None, None, fallback_municipality(), default_price, levels)
 
     try:
         details = catastro.lookup_details(rc)
     except catastro.CatastroRateLimitError:
         rate_limited_flag.set()
-        return _fallback_result(osm_id, geom, rc, address, fallback_municipality, default_price, levels, source="catastro_rate_limited")
+        return _fallback_result(osm_id, geom, rc, address, fallback_municipality(), default_price, levels, source="catastro_rate_limited")
     except Exception:
         logger.warning("Catastro lookup_details failed for osm_id=%s rc=%s", osm_id, rc, exc_info=True)
-        return _fallback_result(osm_id, geom, rc, address, fallback_municipality, default_price, levels, source="catastro_error")
+        return _fallback_result(osm_id, geom, rc, address, fallback_municipality(), default_price, levels, source="catastro_error")
 
     if not details or not details.get("total_built_area_m2"):
-        return _fallback_result(osm_id, geom, rc, address, fallback_municipality, default_price, levels)
+        return _fallback_result(osm_id, geom, rc, address, fallback_municipality(), default_price, levels)
 
     if details["constructions"]:
         value = sum(
@@ -168,7 +192,7 @@ def _lookup_building(feature, default_price, rate_limited_flag, municipalities=N
         "osm_id": osm_id,
         "rc": rc,
         "address": details.get("address") or address,
-        "municipality": details.get("municipality") or fallback_municipality or "Others",
+        "municipality": details.get("municipality") or fallback_municipality() or "Others",
         "year_built": details.get("year_built"),
         "built_area_m2": round(details["total_built_area_m2"], 1),
         "use": details.get("main_use"),
@@ -211,11 +235,16 @@ def group_by_municipality(results):
 def estimate_value_lost(buildings_geojson, default_price_per_m2=DEFAULT_PRICE_PER_M2_EUR, municipalities=None):
     features = buildings_geojson.get("features", [])
     rate_limited_flag = threading.Event()
+    # Prepared once up front rather than per building -- see
+    # _prepare_municipalities -- since every building's lookup would
+    # otherwise re-shape and re-index the same set of municipality
+    # polygons independently (and concurrently, across worker threads).
+    prepared_municipalities = _prepare_municipalities(municipalities)
 
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = [
-            pool.submit(_lookup_building, f, default_price_per_m2, rate_limited_flag, municipalities)
+            pool.submit(_lookup_building, f, default_price_per_m2, rate_limited_flag, prepared_municipalities)
             for f in features
         ]
         for fut in as_completed(futures):

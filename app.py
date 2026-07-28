@@ -1,5 +1,7 @@
 import datetime as dt
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request, Response
@@ -206,12 +208,71 @@ def api_report():
     except (TypeError, ValueError):
         return jsonify({"error": "Missing/invalid 'meta.bbox'"}), 400
     meta["bbox"] = bbox
-    municipalities = municipalities_service.fetch_municipality_boundaries(bbox)
-    try:
-        locator_context = municipalities_service.fetch_locator_context(bbox)
-    except Exception:
-        logger.warning("Locator context lookup failed for report inset", exc_info=True)
+
+    # Scope the municipality-boundary fetch to near the burnt area rather
+    # than the whole drawn box. Confirmed directly against Overpass: the
+    # same admin_level=8 query over a large (~80km) drawn box hit a 504
+    # from Overpass's own server (it's genuinely too expensive), while the
+    # same query padded around a small burnt area resolved in ~5s. Skipped
+    # entirely when there's no burnt area to anchor it to -- with no fire,
+    # there's nothing for these boundaries to add.
+    burnt_area_geojson = payload.get("burnt_area")
+    municipality_bbox = None
+    if burnt_area_geojson:
+        try:
+            mwest, msouth, meast, mnorth = shape(burnt_area_geojson).bounds
+            pad = 0.1
+            municipality_bbox = (mwest - pad, msouth - pad, meast + pad, mnorth + pad)
+        except Exception:
+            logger.warning("Could not derive municipality bbox from burnt area", exc_info=True)
+
+    # These two Overpass lookups don't depend on each other -- run them
+    # concurrently rather than back to back, same reasoning as the
+    # FIRMS/buildings fetch in /api/estimate. Both are purely decorative
+    # (boundary outlines, locator inset) and already degrade gracefully to
+    # "skip it" on failure -- but Overpass itself can take 30-90+ seconds
+    # to time out and retry across its two mirrors when it's having a bad
+    # day (measured directly), and none of that is worth making the user
+    # wait for. A single combined wait() call bounds TOTAL added latency to
+    # one deadline regardless of how many lookups are pending -- calling
+    # .result(timeout=...) on each future separately would instead let the
+    # deadline apply per-future and stack up (12s + 12s = 24s), which is
+    # exactly the bug an earlier version of this had. Deliberately not
+    # using the executor as a context manager, since `with` would block on
+    # shutdown() waiting for a lookup we've already decided to give up on.
+    LOOKUP_DEADLINE_S = 12
+    pool = ThreadPoolExecutor(max_workers=2)
+    municipalities_future = (
+        pool.submit(municipalities_service.fetch_municipality_boundaries, municipality_bbox)
+        if municipality_bbox else None
+    )
+    locator_future = pool.submit(municipalities_service.fetch_locator_context, bbox)
+
+    futures_wait(
+        [f for f in (municipalities_future, locator_future) if f is not None],
+        timeout=LOOKUP_DEADLINE_S,
+    )
+
+    municipalities = []
+    if municipalities_future is not None:
+        if municipalities_future.done():
+            try:
+                municipalities = municipalities_future.result()
+            except Exception:
+                logger.warning("Municipality boundary lookup failed for report", exc_info=True)
+        else:
+            logger.warning("Municipality boundary lookup timed out for report")
+
+    if locator_future.done():
+        try:
+            locator_context = locator_future.result()
+        except Exception:
+            logger.warning("Locator context lookup failed for report inset", exc_info=True)
+            locator_context = {"country": None, "region": None}
+    else:
+        logger.warning("Locator context lookup timed out for report inset")
         locator_context = {"country": None, "region": None}
+    pool.shutdown(wait=False)
 
     png_bytes = report_service.render_report_png(
         fires=fires,

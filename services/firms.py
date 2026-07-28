@@ -39,13 +39,17 @@ def fetch_active_fires(bbox, start_date, day_range=1, source="VIIRS_SNPP_NRT"):
 
     bbox: (west, south, east, north) in WGS84 degrees.
     start_date: 'YYYY-MM-DD', the first day of the range.
-    day_range: number of days of data to pull (1-10, per FIRMS API limit).
+    day_range: number of days of data to pull. FIRMS's area/csv endpoint
+        rejects anything outside 1-5 with its own HTTP 400 (confirmed
+        directly against the live API -- the commonly-cited "1-10 days"
+        limit does not hold for this endpoint/key), so this clamps to that
+        range rather than sending a value FIRMS will refuse outright.
     source: FIRMS sensor/source id, e.g. VIIRS_SNPP_NRT, MODIS_NRT.
     """
     map_key = get_map_key()
     west, south, east, north = bbox
     area = f"{west},{south},{east},{north}"
-    day_range = max(1, min(10, day_range))
+    day_range = max(1, min(5, day_range))
 
     url = f"{FIRMS_BASE_URL}/{map_key}/{source}/{area}/{day_range}/{start_date}"
     try:
@@ -55,6 +59,13 @@ def fetch_active_fires(bbox, start_date, day_range=1, source="VIIRS_SNPP_NRT"):
         raise FirmsError(
             "NASA FIRMS did not respond in time. Try a smaller area, fewer days, or try again shortly."
         ) from exc
+    except requests.exceptions.HTTPError as exc:
+        # A 4xx here means FIRMS rejected the request itself (bad key, bad
+        # day range, malformed area, etc.) -- distinct from a connectivity
+        # failure, so it gets its own message instead of the misleading
+        # "could not reach" text below.
+        detail = resp.text.strip()[:200] if resp is not None else str(exc)
+        raise FirmsError(f"NASA FIRMS rejected the request: {detail}") from exc
     except requests.exceptions.RequestException as exc:
         raise FirmsError(f"Could not reach NASA FIRMS ({exc}). Try again shortly.") from exc
 

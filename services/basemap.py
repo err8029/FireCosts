@@ -8,6 +8,7 @@ rendered on the output. Not for high-traffic/production embedding.
 """
 import io
 import math
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import requests
@@ -84,19 +85,29 @@ def fetch_basemap(bbox, layer="osm", target_tiles_across=4, timeout=10):
     session = requests.Session()
     session.headers.update(_HEADERS)
 
+    def _fetch_one(txy):
+        tx, ty = txy
+        try:
+            resp = session.get(tile_url.format(z=zoom, x=tx, y=ty), timeout=timeout)
+            resp.raise_for_status()
+            # PIL sniffs the actual format from the file signature, unlike
+            # matplotlib's imread which -- given a BytesIO with no
+            # filename to infer an extension from -- assumes PNG and
+            # chokes on JPEG tiles (e.g. Esri's satellite imagery).
+            img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+            return tx, ty, np.asarray(img, dtype=np.float32) / 255.0
+        except Exception:
+            return tx, ty, None
+
+    tile_coords = [(tx, ty) for ty in range(y_min, y_max + 1) for tx in range(x_min, x_max + 1)]
     fetched_any = False
-    for ty in range(y_min, y_max + 1):
-        for tx in range(x_min, x_max + 1):
-            try:
-                resp = session.get(tile_url.format(z=zoom, x=tx, y=ty), timeout=timeout)
-                resp.raise_for_status()
-                # PIL sniffs the actual format from the file signature, unlike
-                # matplotlib's imread which -- given a BytesIO with no
-                # filename to infer an extension from -- assumes PNG and
-                # chokes on JPEG tiles (e.g. Esri's satellite imagery).
-                img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
-                tile = np.asarray(img, dtype=np.float32) / 255.0
-            except Exception:
+    # A handful of concurrent requests (not one per tile) keeps this within
+    # OSM/Esri's "occasional manual use" tile policy while still cutting
+    # wall-clock time substantially versus fetching up to _MAX_TILES tiles
+    # one at a time.
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for tx, ty, tile in pool.map(_fetch_one, tile_coords):
+            if tile is None:
                 continue
             row_off = (ty - y_min) * _TILE_SIZE
             col_off = (tx - x_min) * _TILE_SIZE

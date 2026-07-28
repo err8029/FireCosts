@@ -11,11 +11,34 @@ for a visual reference layer, not a substitute for precise administrative
 geometry (e.g. INE/IGN cadastral boundary products, or Eurostat's own NUTS
 boundary files).
 """
+import threading
+import time
+
 import requests
 from shapely.geometry import LineString, mapping
 from shapely.ops import polygonize, unary_union
 
 from services import overpass
+
+# In-memory caches keyed by (rounded) bbox / center-point: report exports
+# are commonly re-run for the same or an overlapping area (iterating on a
+# date, retrying after a transient failure, etc.), and these boundaries
+# don't change on that timescale -- see services/buildings.py for the same
+# pattern applied to OSM building footprints.
+_CACHE_TTL_SECONDS = 20 * 60
+_boundaries_cache = {}
+_locator_cache = {}
+_cache_lock = threading.Lock()
+
+
+def _bbox_key(bbox):
+    return tuple(round(v, 4) for v in bbox)
+
+
+def _point_key(lat, lon):
+    # Rounded to ~1km -- region/country boundaries are stable at this
+    # precision, so nearby analyses in the same area share a cache entry.
+    return (round(lat, 2), round(lon, 2))
 
 
 def _relation_to_boundary(el):
@@ -45,7 +68,7 @@ def _relation_to_boundary(el):
     return {"name": name, "geometry": mapping(unary_union(polygons))}
 
 
-def fetch_municipality_boundaries(bbox, timeout=30):
+def fetch_municipality_boundaries(bbox, timeout=15):
     """Return [{"name": str, "geometry": GeoJSON geometry}, ...] for Spanish
     municipality (admin_level=8) boundaries intersecting bbox. Returns []
     on any failure -- this is a decorative map layer, not critical data.
@@ -53,7 +76,20 @@ def fetch_municipality_boundaries(bbox, timeout=30):
     Uses a bbox-intersects-linework query: fine here because several small
     municipalities commonly border a modest analysis area, so at least one
     boundary line usually crosses the box.
+
+    Kept deliberately short: callers (see app.py's /api/report) already
+    apply their own hard wall-clock deadline around this being best-effort,
+    so there's no point configuring a long per-attempt timeout here that
+    the caller will abandon anyway.
     """
+    key = _bbox_key(bbox)
+    with _cache_lock:
+        cached = _boundaries_cache.get(key)
+    if cached is not None:
+        cached_at, result = cached
+        if time.time() - cached_at <= _CACHE_TTL_SECONDS:
+            return list(result)
+
     west, south, east, north = bbox
     bbox_str = f"{south},{west},{north},{east}"
     query = f"""
@@ -72,14 +108,18 @@ def fetch_municipality_boundaries(bbox, timeout=30):
         boundary = _relation_to_boundary(el)
         if boundary:
             results.append(boundary)
-    return results
+
+    with _cache_lock:
+        _boundaries_cache[key] = (time.time(), results)
+    return list(results)
 
 
-def fetch_locator_context(bbox, timeout=45):
+def fetch_locator_context(bbox, timeout=15):
     """Return {"country": {...}|None, "region": {...}|None} containing the
     center of bbox, for the report's locator inset map. Returns both as
     None on any failure -- this is a decorative map layer, not critical
-    data.
+    data. Kept short for the same reason as fetch_municipality_boundaries
+    above: the caller applies its own hard deadline regardless.
 
     A country (admin_level=2) or region (admin_level=4 -- in Spain, a
     Comunidad Autonoma, geometrically the same boundary as its NUTS2
@@ -94,6 +134,15 @@ def fetch_locator_context(bbox, timeout=45):
     """
     west, south, east, north = bbox
     lat, lon = (south + north) / 2, (west + east) / 2
+
+    key = _point_key(lat, lon)
+    with _cache_lock:
+        cached = _locator_cache.get(key)
+    if cached is not None:
+        cached_at, result = cached
+        if time.time() - cached_at <= _CACHE_TTL_SECONDS:
+            return result
+
     query = f"""
     [out:json][timeout:{timeout}];
     is_in({lat},{lon})->.a;
@@ -115,4 +164,7 @@ def fetch_locator_context(bbox, timeout=45):
         elif level == "4" and region is None:
             region = _relation_to_boundary(el)
 
-    return {"country": country, "region": region}
+    result = {"country": country, "region": region}
+    with _cache_lock:
+        _locator_cache[key] = (time.time(), result)
+    return result
