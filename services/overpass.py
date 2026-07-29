@@ -17,11 +17,20 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# overpass-api.de is the reference instance; overpass.kumi.systems is a
-# well-established independent mirror (no registration, keeps attic data).
+# overpass.kumi.systems listed first, not overpass-api.de (the more
+# commonly-cited "reference" instance): confirmed directly, from this
+# app's actual Render deployment, that overpass-api.de fails instantly
+# with "Network is unreachable" (a routing-level rejection, not a slow
+# response) while kumi.systems answers a real query fine in ~3.5s.
+# Consistently the more reliable of the two across this project's
+# development (also true from the developer's own network at various
+# points this session) -- trying it first means every query stops wasting
+# its first attempt (and, under services/overpass.py's split time budget,
+# a meaningful chunk of that query's total patience) on an endpoint that's
+# been reliably dead for this app specifically.
 _ENDPOINTS = [
-    "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
 ]
 _HEADERS = {"User-Agent": "Hephaestus/1.0 (personal project; contact: n/a)"}
 
@@ -98,7 +107,7 @@ def _tile_bbox(bbox, max_tile_deg):
     ]
 
 
-def fetch_tiled(bbox, fetch_tile, dedup_key, timeout, max_tile_deg=0.05, split_area_deg2=0.01, max_workers=6):
+def fetch_tiled(bbox, fetch_tile, dedup_key, timeout, max_tile_deg=0.05, split_area_deg2=0.01, max_workers=3):
     """Fetch features covering bbox, splitting it into a grid of smaller
     tiles and fetching them concurrently instead of one query over the
     whole area, when bbox is bigger than split_area_deg2.
@@ -117,12 +126,19 @@ def fetch_tiled(bbox, fetch_tile, dedup_key, timeout, max_tile_deg=0.05, split_a
         straddle two adjacent tiles -- Overpass's bbox filter matches any
         way with at least one node inside, so such a feature comes back
         (with full, undamaged geometry) from every tile it touches.
-    max_workers: how many tiles to fetch concurrently. A lighter per-tile
-        query (e.g. buildings.fetch_building_centers' `out center`, far
-        cheaper than resolving a full footprint) can afford more
-        concurrency than the default without a heavier one starting to
-        strain Overpass -- callers doing a lightweight fetch over a large
-        area should raise this.
+    max_workers: how many tiles to fetch concurrently. Kept low (3) on
+        purpose -- confirmed directly (via this app's own diagnostic
+        endpoint) that a single query against a public Overpass mirror
+        succeeds fine in a few seconds, yet firing a dozen tiles at once
+        still produced consistent all-tiles-failed results. Public
+        Overpass instances enforce their own per-client concurrent-slot
+        limit (commonly just 2-6), so raising this doesn't buy more
+        throughput -- it just means more of the tiles collide with that
+        limit and get rejected, which looks identical to "Overpass is
+        down" from the caller's side even though a single request would
+        have worked. Lighter per-tile queries (e.g.
+        buildings.fetch_building_centers' `out center`) don't change this
+        -- the constraint is connection count, not query weight.
 
     Returns (features, tiles_ok, tiles_total). When bbox needed splitting
     (tiles_total > 1), this never raises itself -- if every tile fails,

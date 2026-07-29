@@ -247,12 +247,11 @@ def fetch_building_centers(bbox, timeout=60, max_tile_deg=0.15):
             dedup_key=lambda feat: feat["properties"]["osm_id"],
             timeout=timeout,
             max_tile_deg=max_tile_deg,
-            # Higher than fetch_buildings' implicit default (6): each tile
-            # is an `out center` query, far cheaper for Overpass to
-            # process than resolving full footprints, so more of them can
-            # run at once before that starts to strain things the way it
-            # would for the heavier full-geometry query.
-            max_workers=12,
+            # Left at fetch_tiled's own default -- confirmed directly that
+            # raising this doesn't help even for a cheap `out center`
+            # query: the limiting factor is Overpass's own per-client
+            # concurrent-connection cap, not how light each individual
+            # query is (see fetch_tiled's docstring).
         )
     except requests.exceptions.Timeout as exc:
         raise BuildingsError(
