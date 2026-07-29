@@ -589,7 +589,12 @@ async function runAnalysis() {
     reportBtn.disabled = false;
     rememberBbox(currentBbox, dateInput.value);
     stopProgress();
-    setStatus("");
+    // buildings_vegetation_skipped: the burnt area came back too large for
+    // a live building/vegetation lookup (see app.py's /api/estimate) --
+    // fires and the burnt-area estimate are still fully valid, just
+    // missing the building/vegetation cross-reference, so this is a
+    // heads-up, not an error.
+    setStatus(data.buildings_vegetation_skipped ? data.buildings_vegetation_skip_reason : "");
   } catch (err) {
     stopProgress();
     setStatus(err.message, true);

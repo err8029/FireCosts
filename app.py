@@ -212,6 +212,48 @@ def api_estimate():
         pad = 0.005
         query_bbox = (west - pad, south - pad, east + pad, north + pad)
 
+        # A large multi-day fire's burnt area can be hundreds of disjoint
+        # patches (confirmed directly: one real ~270km2 fire produced 982
+        # of them) scattered densely enough that grouping nearby patches
+        # into fewer, smaller query regions barely shrinks anything --
+        # merging at even a very tight ~500m radius only cut total area
+        # by ~8% for that fire, because the detections themselves are
+        # spread almost continuously across the whole extent, not in a
+        # few tight clusters with big empty gaps between them. Splitting
+        # a query this large into tiles (see overpass.fetch_tiled) still
+        # means fetching a genuinely enormous amount of OSM data -- no
+        # amount of request-shaping changes that. Past this size, skip
+        # the live lookup outright with a clear reason instead of
+        # attempting (and eventually failing) a fetch that was never
+        # realistic to complete, still returning the fire/burnt-area
+        # data itself (fires/burnt-area come from FIRMS + local geometry
+        # math, not Overpass, so they're unaffected by this).
+        MAX_QUERY_BBOX_DEG2 = float(os.environ.get("ESTIMATE_MAX_QUERY_BBOX_DEG2", 0.1))
+        query_area_deg2 = (query_bbox[2] - query_bbox[0]) * (query_bbox[3] - query_bbox[1])
+        if query_area_deg2 > MAX_QUERY_BBOX_DEG2:
+            logger.info(
+                "Skipping buildings/vegetation lookup: burnt-area query bbox (%.4f deg2) exceeds cap (%.4f)",
+                query_area_deg2, MAX_QUERY_BBOX_DEG2,
+            )
+            return jsonify({
+                "fires": fires,
+                "burnt_area": burnt_area,
+                "burnt_area_km2": round(area_km2, 3),
+                "buildings_total": 0,
+                "buildings_affected": 0,
+                "affected_buildings": {"type": "FeatureCollection", "features": []},
+                "vegetation_burnt_km2": 0.0,
+                "vegetation_by_category": {},
+                "burnt_vegetation": {"type": "FeatureCollection", "features": []},
+                "buildings_vegetation_skipped": True,
+                "buildings_vegetation_skip_reason": (
+                    f"This burnt area ({round(area_km2)} km²) is too large for a live "
+                    "building/vegetation lookup. Fire detections and the burnt-area "
+                    "estimate above are still accurate; try a smaller box or a shorter "
+                    "day range for building/vegetation stats."
+                ),
+            })
+
         # Buildings and vegetation are independent OSM queries -- fetch
         # them concurrently rather than back to back. A hard wall-clock
         # deadline bounds the total wait regardless of how long Overpass's
