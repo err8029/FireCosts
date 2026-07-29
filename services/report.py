@@ -21,13 +21,14 @@ import matplotlib.patheffects as path_effects
 import numpy as np
 from matplotlib import image as mpimg
 from matplotlib.colors import LinearSegmentedColormap, Normalize
-from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.patches import Polygon as MplPolygon, Rectangle
 from matplotlib.collections import PatchCollection
 from matplotlib.lines import Line2D
 from shapely.geometry import box, shape
 
 from services import basemap as basemap_service
 from services import estimate as estimate_service
+from services import landcover as landcover_service
 from services import valuation as valuation_service
 
 _M_PER_DEG_LAT = 111_320.0
@@ -53,8 +54,17 @@ def _polygon_patches(geometry):
 def _add_basemap(ax, bbox, layer):
     """Fetch and draw a tile basemap (OSM or satellite) behind everything
     else. Returns True if a basemap was drawn, so the caller can render
-    the matching attribution."""
-    result = basemap_service.fetch_basemap(bbox, layer=layer)
+    the matching attribution.
+
+    target_tiles_across=6 (up from the fetch_basemap default of 4): more
+    tiles means a higher zoom level gets picked for the same analysis
+    box, so the basemap shows more real detail (street names, smaller
+    buildings, finer terrain) instead of a coarser, more zoomed-out tile
+    set -- worth the extra download now that tiles are cached (see
+    basemap._tile_cache) and the fetch itself is deadline-bounded, so
+    more tiles no longer means more risk of a slow/hanging report.
+    """
+    result = basemap_service.fetch_basemap(bbox, layer=layer, target_tiles_across=6)
     if not result:
         return False
     mosaic, (west, east, south, north) = result
@@ -127,6 +137,47 @@ def _reclassify_municipalities(valuation, affected_buildings, municipalities):
         "buildings": updated_buildings,
         "by_municipality": valuation_service.group_by_municipality(updated_buildings),
     }
+
+
+def _vegetation_value_by_category(vegetation_features, price_per_hectare_by_category=None):
+    """Group burnt vegetation by land-cover category (forest, scrub/heath,
+    grassland, farmland) and estimate its value using a per-category
+    assumed price/hectare (see landcover.DEFAULT_PRICE_PER_HECTARE_EUR) --
+    the same "real area x assumed price" methodology the buildings
+    value-lost table uses (see valuation.py), but priced per land-cover
+    category instead of a single flat rate, since forest, scrub, grassland
+    and farmland are not realistically worth the same per hectare.
+
+    Deliberately grouped by category rather than municipality: unlike
+    buildings (Catastro gives a municipality directly) or even the
+    map/live-lookup path app.py's /api/report route uses, a category
+    breakdown needs nothing from Overpass at all, so it stays fully
+    populated even on a bad Overpass day, or if this area straddles
+    several small municipalities each with only a sliver of the total.
+
+    price_per_hectare_by_category: {category: EUR/ha}, falling back to
+    landcover.DEFAULT_PRICE_PER_HECTARE_EUR for any category missing from
+    it (e.g. a user who only overrides one category).
+
+    Returns a list of {"category", "area_km2", "value_eur"} sorted by
+    value descending.
+    """
+    prices = dict(landcover_service.DEFAULT_PRICE_PER_HECTARE_EUR)
+    prices.update(price_per_hectare_by_category or {})
+
+    totals = {}
+    for feat in vegetation_features or []:
+        props = feat.get("properties", {})
+        category = props.get("category")
+        area_km2 = props.get("area_km2") or 0.0
+        if not area_km2 or category not in prices:
+            continue
+
+        entry = totals.setdefault(category, {"category": category, "area_km2": 0.0, "value_eur": 0.0})
+        entry["area_km2"] += area_km2
+        entry["value_eur"] += area_km2 * 100 * prices[category]
+
+    return sorted(totals.values(), key=lambda e: e["value_eur"], reverse=True)
 
 
 def _add_municipality_boundaries(ax, municipalities, bbox, top_names=None, max_count=15):
@@ -205,13 +256,19 @@ def _mainland_bounds(geom):
 
 
 def _add_locator_inset(ax, country, region, analysis_bbox):
-    """Zoomed-out inset in the map's top-right corner: the country (faint
+    """Zoomed-out inset in the map's top-left corner: the country (faint
     background context) and the containing region (Comunidad Autonoma --
     geometrically the same boundary as its NUTS2 statistical region)
     highlighted, with the analysis box's location marked, so a viewer
     unfamiliar with the exact area can see where it sits. Skipped entirely
-    if no region was found (e.g. bbox isn't in Spain, or Overpass was
-    unavailable).
+    if no region was found (e.g. bbox isn't in Spain, or Overpass/the
+    bundled dataset was unavailable).
+
+    Top-left rather than top-right: with the wider margin below (see
+    _render_map_figure's pad_x/pad_y), fires/buildings near the analysis
+    box's edges tend to sit close to the box itself, and the top-left
+    corner of that margin is the part least likely to have real content
+    worth seeing under the inset.
 
     Zoomed to fit the country's mainland (see _mainland_bounds) when
     available, so the country's actual outline/coastline is visible rather
@@ -221,7 +278,7 @@ def _add_locator_inset(ax, country, region, analysis_bbox):
     if not region:
         return
 
-    inset = ax.inset_axes([0.66, 0.66, 0.32, 0.32])
+    inset = ax.inset_axes([0.02, 0.66, 0.32, 0.32])
     inset.set_facecolor("#f5f5f0")
     inset.set_zorder(20)
 
@@ -277,6 +334,35 @@ def _add_burnt_area(ax, burnt_area_geojson):
     ax.add_collection(PatchCollection(
         patches, facecolor="#ff6b6b", edgecolor="#c0392b", alpha=0.25, linewidth=1, zorder=1,
     ))
+
+
+def _add_vegetation(ax, vegetation_geojson):
+    """Draw burnt vegetation/land-cover polygons (already clipped to the
+    burnt area by estimate.vegetation_in_burnt_area), colored by category.
+    Drawn above the burnt-area wash but below buildings/fires, since it's
+    "what kind of land burned" context rather than the headline data.
+
+    Returns the set of categories actually present, so the legend only
+    lists categories that showed up in this analysis.
+    """
+    features = vegetation_geojson.get("features", []) if vegetation_geojson else []
+    if not features:
+        return set()
+
+    by_category = {}
+    for feat in features:
+        category = feat.get("properties", {}).get("category", "other")
+        by_category.setdefault(category, []).extend(_polygon_patches(feat["geometry"]))
+
+    for category, patches in by_category.items():
+        if not patches:
+            continue
+        color = landcover_service.CATEGORY_COLORS.get(category, "#777777")
+        ax.add_collection(PatchCollection(
+            patches, facecolor=color, edgecolor=color, alpha=0.55, linewidth=0.5, zorder=1.5,
+        ))
+
+    return set(by_category.keys())
 
 
 def _sort_by_value_ascending(xs, ys, values):
@@ -451,7 +537,7 @@ def _vstack(arrays, gaps=24):
     return np.concatenate(parts, axis=0)
 
 
-def _render_map_figure(fires, burnt_area, affected_buildings, valuation, municipalities, country, region, meta):
+def _render_map_figure(fires, burnt_area, affected_buildings, vegetation, vegetation_km2, valuation, municipalities, country, region, meta):
     west, south, east, north = meta["bbox"]
     mean_lat = (south + north) / 2
     lon_span_m = (east - west) * _M_PER_DEG_LAT * max(math.cos(math.radians(mean_lat)), 0.15)
@@ -466,6 +552,7 @@ def _render_map_figure(fires, burnt_area, affected_buildings, valuation, municip
 
     has_basemap = _add_basemap(ax, meta["bbox"], meta.get("basemap", "osm"))
     _add_burnt_area(ax, burnt_area)
+    vegetation_categories = _add_vegetation(ax, vegetation)
     top_names = _top_municipality_names(valuation)
     has_boundaries, muni_label_candidates = _add_municipality_boundaries(
         ax, municipalities, meta["bbox"], top_names=top_names,
@@ -489,7 +576,7 @@ def _render_map_figure(fires, burnt_area, affected_buildings, valuation, municip
     collection = buildings_mappable or fires_mappable
 
     # Wider than a purely cosmetic margin would need: the extra room keeps
-    # the locator inset (top-right corner) from sitting on top of real fire
+    # the locator inset (top-left corner) from sitting on top of real fire
     # detections or buildings that would otherwise extend into that corner.
     pad_x = (east - west) * 0.18 or 0.001
     pad_y = (north - south) * 0.18 or 0.001
@@ -519,6 +606,8 @@ def _render_map_figure(fires, burnt_area, affected_buildings, valuation, municip
         f"{meta.get('date', '')} · {meta.get('days', 1)} day(s) · {meta.get('source', '')} · "
         f"{fires_count} fire detections · {buildings_count} buildings affected"
     )
+    if vegetation_km2:
+        subtitle += f" · {vegetation_km2:.2f} km² forest/vegetation burnt"
     if valuation:
         subtitle += f" · {_fmt_eur(valuation['total_value_eur'])} estimated value lost"
 
@@ -532,6 +621,14 @@ def _render_map_figure(fires, burnt_area, affected_buildings, valuation, municip
         MplPolygon([[0, 0], [1, 0], [1, 1]], closed=True, facecolor="#ff6b6b", edgecolor="#c0392b",
                    alpha=0.25, label="Estimated burnt area"),
     ]
+    # Only the categories actually present -- most analyses won't have all
+    # four, and an always-full legend would misleadingly suggest otherwise.
+    for category in sorted(vegetation_categories):
+        color = landcover_service.CATEGORY_COLORS.get(category, "#777777")
+        legend_handles.append(
+            MplPolygon([[0, 0], [1, 0], [1, 1]], closed=True, facecolor=color, edgecolor=color,
+                       alpha=0.55, label=landcover_service.category_label(category))
+        )
     if affected_buildings and affected_buildings.get("features"):
         legend_handles.append(
             MplPolygon([[0, 0], [1, 0], [1, 1]], closed=True, facecolor="none", edgecolor="#333333",
@@ -576,6 +673,69 @@ def _render_legend_figure(legend_handles):
     return fig
 
 
+def _add_table_value_bars(fig, ax, tbl, values, col_index, color, skip_last=True):
+    """Overlay a horizontal bar in the given table column for each data
+    row, scaled to that row's value relative to the largest in the table
+    -- a compact, embedded visual alongside the raw numbers (Excel "data
+    bar" style), rather than a separate chart elsewhere in the report.
+
+    `values` must align 1:1 with the table's data rows in order (table row
+    i+1, since row 0 is the header). The final row (TOTAL) is skipped by
+    default, both as a bar and as part of the scaling baseline, since
+    including it would dwarf every individual row down to an invisible
+    sliver.
+
+    `color` is either one color for every bar, or a list/tuple with one
+    color per row (e.g. the vegetation table uses each category's own map
+    color, so the bar reads as "the same green means forest" everywhere
+    in the report, not just an arbitrary single accent color).
+
+    matplotlib table cells don't get their real position/size until the
+    figure has been drawn at least once (before that, every cell reports
+    y=0). A cell's own x/y/width/height plus its own get_transform() looks
+    like it should give a correct bbox directly, but empirically does not
+    (verified: with non-uniform colWidths, reconstructing a bbox that way
+    put every bar in a tiny sliver at the cell's right edge, regardless of
+    ratio) -- get_window_extent(), the documented API for "where does this
+    artist actually render", is what gives the real bbox, so that's used
+    here instead, converted from display (pixel) coordinates back into
+    the axes' data space where a plain Rectangle behaves normally.
+    """
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    inv = ax.transData.inverted()
+
+    bar_values = values[:-1] if skip_last and len(values) > 1 else values
+    max_value = max(bar_values) if bar_values else 0
+    if max_value <= 0:
+        return
+    for i, value in enumerate(bar_values):
+        cell = tbl[i + 1, col_index]
+        cell.get_text().set_text("")
+        bbox = cell.get_window_extent(renderer)
+        x0, y0 = inv.transform((bbox.x0, bbox.y0))
+        x1, y1 = inv.transform((bbox.x1, bbox.y1))
+        left, right = sorted((x0, x1))
+        bottom, top = sorted((y0, y1))
+        w, h = right - left, top - bottom
+
+        ratio = min(value / max_value, 1.0)
+        # Fixed side margins, with the bar's width scaled against the
+        # remaining usable space (not against the raw cell width) and a
+        # floor so a small-but-nonzero value still shows as a visible
+        # sliver instead of vanishing outright -- same reasoning as the
+        # sidebar bar chart's Math.max(ratio * 100, 2) in map.js.
+        pad_frac = 0.06
+        usable_w = w * (1 - 2 * pad_frac)
+        bar_w = max(usable_w * ratio, usable_w * 0.02) if ratio > 0 else 0
+        row_color = color[i] if isinstance(color, (list, tuple)) else color
+        ax.add_patch(Rectangle(
+            (left + w * pad_frac, bottom + h * pad_frac),
+            bar_w, h * (1 - 2 * pad_frac),
+            facecolor=row_color, edgecolor="none", alpha=0.75, zorder=5,
+        ))
+
+
 def _render_table_figure(valuation):
     fig = plt.figure(figsize=(10, 0.9))
     ax = fig.add_subplot(111)
@@ -593,19 +753,24 @@ def _render_table_figure(valuation):
     shown_rows = rows[:top_n]
     remaining_rows = rows[top_n:]
 
-    col_labels = ["Municipality / village", "Buildings affected", "Estimated value lost"]
-    cell_text = [[r["municipality"], str(r["buildings"]), _fmt_eur(r["value_eur"])] for r in shown_rows]
+    col_labels = ["Municipality / village", "Buildings affected", "Estimated value lost", "Relative value"]
+    cell_text = [[r["municipality"], str(r["buildings"]), _fmt_eur(r["value_eur"]), ""] for r in shown_rows]
+    bar_values = [r["value_eur"] for r in shown_rows]
 
     others_row_idx = None
     if remaining_rows:
         others_row_idx = len(cell_text)
+        others_value = sum(r["value_eur"] for r in remaining_rows)
         cell_text.append([
             f"Others ({len(remaining_rows)} more)",
             str(sum(r["buildings"] for r in remaining_rows)),
-            _fmt_eur(sum(r["value_eur"] for r in remaining_rows)),
+            _fmt_eur(others_value),
+            "",
         ])
+        bar_values.append(others_value)
 
-    cell_text.append(["TOTAL", str(valuation["buildings_priced"]), _fmt_eur(valuation["total_value_eur"])])
+    cell_text.append(["TOTAL", str(valuation["buildings_priced"]), _fmt_eur(valuation["total_value_eur"]), ""])
+    bar_values.append(valuation["total_value_eur"])
 
     row_h = 0.42
     fig.set_size_inches(10, 1.1 + row_h * (len(cell_text) + 1))
@@ -614,28 +779,88 @@ def _render_table_figure(valuation):
     if remaining_rows:
         title += f" (top {top_n})"
     ax.set_title(title, fontsize=12, fontweight="bold", loc="left")
-    tbl = ax.table(cellText=cell_text, colLabels=col_labels, loc="upper center", cellLoc="left")
+    tbl = ax.table(
+        cellText=cell_text, colLabels=col_labels, loc="upper center", cellLoc="left",
+        colWidths=[0.40, 0.16, 0.22, 0.22],
+    )
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(9)
     tbl.scale(1, 1.6)
+    _add_table_value_bars(fig, ax, tbl, bar_values, col_index=3, color="#c0392b")
 
     if others_row_idx is not None:
-        for col in range(3):
+        for col in range(4):
             tbl[others_row_idx + 1, col].set_text_props(style="italic", color="#555555")
 
     n_rows = len(cell_text)
-    for col in range(3):
+    for col in range(4):
         tbl[n_rows, col].set_text_props(fontweight="bold")
         tbl[n_rows, col].set_facecolor("#f0f0f0")
 
     return fig
 
 
-def _render_footer_figure():
+def _render_vegetation_table_figure(vegetation_by_category):
+    fig = plt.figure(figsize=(10, 0.9))
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+
+    if not vegetation_by_category:
+        ax.text(0, 0.5, "No burnt vegetation was found to value.", fontsize=10)
+        return fig
+
+    rows = vegetation_by_category
+
+    col_labels = ["Vegetation type", "Area burnt (km²)", "Estimated vegetation value", "Relative value"]
+    cell_text = [
+        [landcover_service.category_label(r["category"]), f"{r['area_km2']:.3f}", _fmt_eur(r["value_eur"]), ""]
+        for r in rows
+    ]
+    bar_values = [r["value_eur"] for r in rows]
+    bar_colors = [landcover_service.CATEGORY_COLORS.get(r["category"], "#2e7d32") for r in rows]
+
+    total_area = sum(r["area_km2"] for r in rows)
+    total_value = sum(r["value_eur"] for r in rows)
+    cell_text.append(["TOTAL", f"{total_area:.3f}", _fmt_eur(total_value), ""])
+    bar_values.append(total_value)
+    bar_colors.append("#2e7d32")
+
+    row_h = 0.42
+    fig.set_size_inches(10, 1.1 + row_h * (len(cell_text) + 1))
+
+    ax.set_title("Estimated vegetation value lost by type", fontsize=12, fontweight="bold", loc="left")
+    tbl = ax.table(
+        cellText=cell_text, colLabels=col_labels, loc="upper center", cellLoc="left",
+        colWidths=[0.38, 0.18, 0.24, 0.20],
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    tbl.scale(1, 1.6)
+    _add_table_value_bars(fig, ax, tbl, bar_values, col_index=3, color=bar_colors)
+
+    n_rows = len(cell_text)
+    for col in range(4):
+        tbl[n_rows, col].set_text_props(fontweight="bold")
+        tbl[n_rows, col].set_facecolor("#f0f0f0")
+
+    return fig
+
+
+def _render_footer_figure(vegetation_prices=None):
+    prices = dict(landcover_service.DEFAULT_PRICE_PER_HECTARE_EUR)
+    prices.update(vegetation_prices or {})
+    price_list = ", ".join(
+        f"{landcover_service.category_label(cat).lower()} €{prices[cat]:,.0f}/ha"
+        for cat in ("forest", "scrub_heath", "grassland", "farmland")
+    )
     footer = (
         "Burnt area is a proxy built by buffering active-fire detections, not an official burn "
-        "perimeter. Value estimates combine real Catastro built areas (Spain only) or OSM "
-        "footprints (x floor count, when available) with an assumed price/m² -- not an official appraisal."
+        "perimeter. Forest/vegetation burnt is estimated from OpenStreetMap land-cover tagging "
+        "clipped to that same proxy, not a dedicated land-cover product. Value estimates combine "
+        "real Catastro built areas (Spain only) or OSM footprints (x floor count, when available) "
+        "with an assumed price/m² -- not an official appraisal. Vegetation value uses that same "
+        f"area per category crossed with an assumed (user-editable) price/hectare -- {price_list} -- "
+        "rough illustrative figures, not a market appraisal or timber valuation."
     )
     fig = plt.figure(figsize=(10, 0.5))
     ax = fig.add_subplot(111)
@@ -644,31 +869,51 @@ def _render_footer_figure():
     return fig
 
 
-def render_report_png(fires, burnt_area, affected_buildings, valuation, municipalities, country, region, meta):
+def render_report_png(fires, burnt_area, affected_buildings, vegetation, vegetation_km2, valuation, municipalities, country, region, meta, vegetation_price_per_hectare=None):
     """Return PNG bytes for the report.
 
     fires: FeatureCollection of active-fire points
     burnt_area: burnt-area geometry (Polygon/MultiPolygon) or None
     affected_buildings: FeatureCollection of affected building footprints
+    vegetation: FeatureCollection of burnt vegetation/land-cover polygons
+        (see services.estimate.vegetation_in_burnt_area), or None
+    vegetation_km2: total burnt vegetation area in km2, for the subtitle
     valuation: result dict from services.valuation.estimate_value_lost, or None
     municipalities: list of {"name", "geometry"} from services.municipalities, or None
     country, region: {"name", "geometry"} for the locator inset (see
         services.municipalities.fetch_locator_context), or None to skip it
     meta: dict with title info -- bbox, date, days, source
+    vegetation_price_per_hectare: user-editable {category: EUR/ha} price
+        matrix for the vegetation-value table, or None/partial to fall
+        back to landcover.DEFAULT_PRICE_PER_HECTARE_EUR per category
     """
     valuation = _reclassify_municipalities(valuation, affected_buildings, municipalities)
+    vegetation_by_category = _vegetation_value_by_category(
+        (vegetation or {}).get("features", []),
+        price_per_hectare_by_category=vegetation_price_per_hectare,
+    )
 
     map_fig, legend_handles = _render_map_figure(
-        fires, burnt_area, affected_buildings, valuation, municipalities, country, region, meta
+        fires, burnt_area, affected_buildings, vegetation, vegetation_km2,
+        valuation, municipalities, country, region, meta,
     )
     # Trimmed (not just zero-padded) so the map's bottom edge and the
     # legend box's top edge sit truly flush with no visible gap.
     map_arr = _trim_vertical_whitespace(_fig_to_array(map_fig, pad_inches=0))
     legend_arr = _trim_vertical_whitespace(_fig_to_array(_render_legend_figure(legend_handles), pad_inches=0))
     table_arr = _fig_to_array(_render_table_figure(valuation))
-    footer_arr = _fig_to_array(_render_footer_figure())
+    vegetation_table_arr = _fig_to_array(_render_vegetation_table_figure(vegetation_by_category))
+    footer_arr = _fig_to_array(_render_footer_figure(vegetation_price_per_hectare))
 
-    combined = _vstack([map_arr, legend_arr, table_arr, footer_arr], gaps=[0, 24, 24])
+    # Buildings table -> vegetation table gets a much tighter gap than the
+    # others: they're two halves of one "value lost" picture, so reading
+    # as a closer pair rather than as separately-sectioned content is the
+    # point (unlike the legend/footer gaps, which separate genuinely
+    # distinct report sections).
+    combined = _vstack(
+        [map_arr, legend_arr, table_arr, vegetation_table_arr, footer_arr],
+        gaps=[0, 24, 8, 24],
+    )
 
     buf = io.BytesIO()
     mpimg.imsave(buf, combined, format="png")

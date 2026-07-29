@@ -12,6 +12,8 @@ from werkzeug.exceptions import HTTPException
 from services import buildings as buildings_service
 from services import estimate as estimate_service
 from services import firms as firms_service
+from services import geocode as geocode_service
+from services import landcover as landcover_service
 from services import municipalities as municipalities_service
 from services import report as report_service
 from services import valuation as valuation_service
@@ -90,6 +92,63 @@ def api_fires():
     return jsonify(fires)
 
 
+# Roughly mainland Spain + Balearics, used only for the active-fire
+# "pointer" overview shown on first load (before the user has drawn any
+# box of their own) -- see api_active_fires_overview below. FIRMS's
+# area/csv endpoint caps a single request's box at 20 degrees in each
+# direction, comfortably above this ~14 x 8 degree extent, so it's one
+# request rather than needing firms.fetch_active_fires' own chunking.
+SPAIN_BBOX = (-9.5, 35.9, 4.6, 43.9)
+MAX_OVERVIEW_CLUSTERS = 15
+GEOCODE_DEADLINE_S = 12
+
+
+@app.route("/api/active-fires-overview")
+def api_active_fires_overview():
+    """Return a handful of rough {"lat","lon","label","count","max_frp"}
+    clusters for the active fires currently detected across Spain, so the
+    map can show the user roughly where to draw their analysis box before
+    they've picked an area -- e.g. one pointer near "Sierra Oeste" instead
+    of nothing until they already know where to look.
+
+    Deliberately coarse and best-effort: this is a "here's roughly where
+    to look" guide, not the precise per-fire data /api/fires and
+    /api/estimate provide once the user has drawn a box.
+    """
+    start_date = request.args.get("start", dt.date.today().isoformat())
+    day_range = int(request.args.get("days", 1))
+    source = request.args.get("source", "VIIRS_SNPP_NRT")
+
+    try:
+        fires = firms_service.fetch_active_fires(SPAIN_BBOX, start_date, day_range, source)
+    except firms_service.FirmsError as exc:
+        return jsonify({"error": str(exc)}), 502
+
+    clusters = firms_service.cluster_fires(fires)[:MAX_OVERVIEW_CLUSTERS]
+
+    if clusters:
+        # Reverse-geocoding each cluster is its own rate-limited (see
+        # geocode.py) network call, run one at a time on a single worker
+        # (Nominatim's usage policy caps this at 1 request/second anyway,
+        # so extra workers wouldn't help). Each cluster gets its own
+        # future rather than one future for the whole list, so if the
+        # shared deadline is hit partway through, clusters already
+        # resolved keep their label instead of every cluster losing it
+        # just because a later one was slow -- same reasoning as the
+        # municipality/locator lookups in /api/report degrading
+        # individually rather than all-or-nothing.
+        pool = ThreadPoolExecutor(max_workers=1)
+        label_futures = [
+            pool.submit(geocode_service.reverse_geocode, c["lat"], c["lon"]) for c in clusters
+        ]
+        futures_wait(label_futures, timeout=GEOCODE_DEADLINE_S)
+        for cluster, future in zip(clusters, label_futures):
+            cluster["label"] = future.result() if future.done() else None
+        pool.shutdown(wait=False)
+
+    return jsonify({"clusters": clusters})
+
+
 @app.route("/api/buildings")
 def api_buildings():
     try:
@@ -124,27 +183,74 @@ def api_estimate():
     burnt_area, area_km2 = estimate_service.build_burnt_area(fires, source=source)
 
     if burnt_area is None:
-        # Nothing burning in this box -- no building can be "affected", so
-        # skip the OSM building query entirely instead of fetching every
-        # building in the whole drawn box just to report a count against
-        # zero fires.
+        # Nothing burning in this box -- no building or vegetation stat can
+        # be "affected", so skip both OSM queries entirely instead of
+        # fetching everything in the whole drawn box just to report counts
+        # against zero fires.
         affected, total_count, affected_count = [], 0, 0
+        vegetation_features, vegetation_km2, vegetation_by_category = [], 0.0, {}
     else:
-        # Only buildings near the burnt area can ever end up "affected" --
-        # querying just that (small) bounding box instead of the whole
-        # drawn box is what keeps this fast even when the box is large but
-        # the fire itself covers a tiny fraction of it. Small pad (~500m)
-        # comfortably covers a building whose footprint straddles the edge
-        # of the burnt-area bounds even though its centroid falls inside.
+        # Only buildings/vegetation near the burnt area can ever end up
+        # "affected" -- querying just that (small) bounding box instead of
+        # the whole drawn box is what keeps this fast even when the box is
+        # large but the fire itself covers a tiny fraction of it. Small pad
+        # (~500m) comfortably covers a building whose footprint straddles
+        # the edge of the burnt-area bounds even though its centroid falls
+        # inside.
         west, south, east, north = shape(burnt_area).bounds
         pad = 0.005
         query_bbox = (west - pad, south - pad, east + pad, north + pad)
+
+        # Buildings and vegetation are independent OSM queries -- fetch
+        # them concurrently rather than back to back. A hard wall-clock
+        # deadline bounds the total wait regardless of how long Overpass's
+        # own internal retry/mirror-fallback ends up taking -- confirmed
+        # directly that Overpass can take 20s+ to even fail a single
+        # simple query on a bad day, and this call previously had no
+        # deadline at all, so a bad Overpass day could hang the whole
+        # Analyze step for minutes with the progress indicator stuck
+        # waiting. Buildings are essential to the analysis, so a timeout
+        # here is a real error; vegetation is supplementary and degrades
+        # to empty instead, same reasoning as the municipality/locator
+        # lookups in /api/report. Deliberately not using the executor as
+        # a context manager, since `with` would block on shutdown()
+        # waiting for a fetch we've already decided to give up on.
+        FETCH_DEADLINE_S = 30
+        pool = ThreadPoolExecutor(max_workers=2)
+        buildings_future = pool.submit(buildings_service.fetch_buildings, query_bbox)
+        vegetation_future = pool.submit(landcover_service.fetch_vegetation, query_bbox)
+
+        futures_wait([buildings_future, vegetation_future], timeout=FETCH_DEADLINE_S)
+
+        if not buildings_future.done():
+            pool.shutdown(wait=False)
+            return jsonify({
+                "error": "OpenStreetMap's building data service (Overpass) did not respond "
+                         "in time. Try a smaller area, or try again shortly."
+            }), 502
+
         try:
-            all_buildings = buildings_service.fetch_buildings(query_bbox)
+            all_buildings = buildings_future.result()
         except buildings_service.BuildingsError as exc:
+            pool.shutdown(wait=False)
             return jsonify({"error": str(exc)}), 400
+
+        if vegetation_future.done():
+            try:
+                vegetation_geojson = vegetation_future.result()
+            except landcover_service.LandcoverError:
+                logger.warning("Vegetation lookup failed for estimate", exc_info=True)
+                vegetation_geojson = {"type": "FeatureCollection", "features": []}
+        else:
+            logger.warning("Vegetation lookup timed out for estimate")
+            vegetation_geojson = {"type": "FeatureCollection", "features": []}
+        pool.shutdown(wait=False)
+
         affected, total_count, affected_count = estimate_service.buildings_in_burnt_area(
             all_buildings, burnt_area
+        )
+        vegetation_features, vegetation_km2, vegetation_by_category = estimate_service.vegetation_in_burnt_area(
+            vegetation_geojson, burnt_area
         )
 
     return jsonify({
@@ -154,6 +260,9 @@ def api_estimate():
         "buildings_total": total_count,
         "buildings_affected": affected_count,
         "affected_buildings": {"type": "FeatureCollection", "features": affected},
+        "vegetation_burnt_km2": round(vegetation_km2, 3),
+        "vegetation_by_category": {k: round(v, 3) for k, v in vegetation_by_category.items()},
+        "burnt_vegetation": {"type": "FeatureCollection", "features": vegetation_features},
     })
 
 
@@ -175,15 +284,28 @@ def api_valuation():
     # for buildings that fall back to the OSM-estimate path (no Catastro
     # match) than OSM's addr:city tag, which most buildings don't have set.
     # Best-effort: if Overpass is unavailable/rate-limited, valuation still
-    # proceeds, just without this extra classification.
+    # proceeds, just without this extra classification -- but that was only
+    # true in spirit until now: this call had no actual deadline, so a slow
+    # Overpass day (confirmed directly: a single query can take 100s+ once
+    # its internal retries/mirror-fallback all end up timing out rather
+    # than failing cleanly) could hang the whole "Estimate value lost"
+    # request for minutes. Bounded the same way as the lookups in
+    # /api/report.
     municipalities = []
     try:
         geoms = [shape(f["geometry"]) for f in buildings["features"]]
         west, south, east, north = unary_union(geoms).bounds
         pad = 0.01
-        municipalities = municipalities_service.fetch_municipality_boundaries(
-            (west - pad, south - pad, east + pad, north + pad)
-        )
+        muni_bbox = (west - pad, south - pad, east + pad, north + pad)
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        muni_future = pool.submit(municipalities_service.fetch_municipality_boundaries, muni_bbox)
+        futures_wait([muni_future], timeout=12)
+        if muni_future.done():
+            municipalities = muni_future.result()
+        else:
+            logger.warning("Municipality boundary lookup timed out for valuation")
+        pool.shutdown(wait=False)
     except Exception:
         logger.warning("Municipality boundary lookup failed for valuation", exc_info=True)
 
@@ -240,8 +362,16 @@ def api_report():
     # exactly the bug an earlier version of this had. Deliberately not
     # using the executor as a context manager, since `with` would block on
     # shutdown() waiting for a lookup we've already decided to give up on.
+    #
+    # 25s, not 12s: fetch_locator_context's query is inherently heavier
+    # than a municipality-boundary lookup -- it pulls full country *and*
+    # region boundary geometry (out geom), and measured directly at ~18s
+    # even on a healthy connection. A 12s deadline meant the locator
+    # inset (country/region minimap with a star on the analysis
+    # location) was being silently abandoned on essentially every report,
+    # not just on a bad Overpass day.
     LOOKUP_DEADLINE_S = 12
-    pool = ThreadPoolExecutor(max_workers=2)
+    pool = ThreadPoolExecutor(max_workers=4)
     municipalities_future = (
         pool.submit(municipalities_service.fetch_municipality_boundaries, municipality_bbox)
         if municipality_bbox else None
@@ -274,15 +404,98 @@ def api_report():
         locator_context = {"country": None, "region": None}
     pool.shutdown(wait=False)
 
+    # Unlike buildings (which usually get their municipality straight from
+    # Catastro), burnt vegetation has no such direct source -- it relies
+    # entirely on the boundary list above, whose bbox-intersects-linework
+    # query only finds a municipality when its edge happens to cross the
+    # (small, burnt-area-sized) query box. A vegetation polygon sitting
+    # deep inside one large rural municipality with no bordering neighbor
+    # nearby would otherwise never get classified at all. Resolve any
+    # vegetation centroid the boundary list doesn't already cover with a
+    # direct point-in-polygon lookup instead, same deadline-bounded
+    # pattern as above.
+    vegetation_geojson = payload.get("burnt_vegetation") or {}
+    veg_features = vegetation_geojson.get("features", [])
+    if veg_features:
+        prepared_municipalities = valuation_service._prepare_municipalities(municipalities)
+        point_by_key = {}
+        features_by_key = {}
+        for feat in veg_features:
+            try:
+                centroid = shape(feat["geometry"]).centroid
+            except Exception:
+                continue
+            name = valuation_service.municipality_for_point(centroid, prepared_municipalities)
+            if name:
+                # Cache the match directly on the feature so report.py uses
+                # it as-is (see below for why re-deriving it there is the
+                # actual bug being avoided).
+                feat.setdefault("properties", {})["municipality"] = name
+                continue
+            # Rounded to the same ~1km precision as
+            # municipalities._point_key, not finer -- otherwise two
+            # vegetation patches a few hundred meters apart (commonly the
+            # same municipality) would round to different keys here, each
+            # firing its own live Overpass query even though they'd hit
+            # the exact same cache entry once queried. That mismatch was
+            # multiplying Overpass load for no benefit.
+            key = (round(centroid.y, 2), round(centroid.x, 2))
+            point_by_key[key] = centroid
+            features_by_key.setdefault(key, []).append(feat)
+
+        # Bound worst-case query complexity regardless of how many distinct
+        # unmatched points a fragmented burnt area produces -- the
+        # remaining ones simply stay "Others" rather than growing the
+        # batched query below without limit.
+        MAX_LIVE_MUNICIPALITY_LOOKUPS = 20
+        if len(point_by_key) > MAX_LIVE_MUNICIPALITY_LOOKUPS:
+            point_by_key = dict(list(point_by_key.items())[:MAX_LIVE_MUNICIPALITY_LOOKUPS])
+
+        if point_by_key:
+            # One batched, cached Overpass request for every remaining
+            # point instead of one live request per point -- see
+            # municipalities_service.fetch_municipalities_for_points for
+            # why this is the actual fix for report generation being slow
+            # (each separate round-trip pays the same network latency,
+            # which this app has seen spike into the tens of seconds
+            # during Overpass service degradation, so N points used to
+            # mean N times that latency instead of 1).
+            keys = list(point_by_key.keys())
+            veg_pool = ThreadPoolExecutor(max_workers=1)
+            veg_future = veg_pool.submit(
+                municipalities_service.fetch_municipalities_for_points,
+                [(point_by_key[k].y, point_by_key[k].x) for k in keys],
+            )
+            futures_wait([veg_future], timeout=LOOKUP_DEADLINE_S)
+            found_per_point = veg_future.result() if veg_future.done() else [None] * len(keys)
+            veg_pool.shutdown(wait=False)
+
+            for key, found in zip(keys, found_per_point):
+                if not found:
+                    continue
+                for feat in features_by_key[key]:
+                    feat.setdefault("properties", {})["municipality"] = found["name"]
+                municipalities.append(found)
+
+    vegetation_price_per_hectare = {}
+    for category, price in (payload.get("vegetation_price_per_hectare") or {}).items():
+        try:
+            vegetation_price_per_hectare[category] = float(price)
+        except (TypeError, ValueError):
+            continue
+
     png_bytes = report_service.render_report_png(
         fires=fires,
         burnt_area=payload.get("burnt_area"),
         affected_buildings=affected_buildings,
+        vegetation=payload.get("burnt_vegetation"),
+        vegetation_km2=payload.get("vegetation_burnt_km2") or 0,
         valuation=payload.get("valuation"),
         municipalities=municipalities,
         country=locator_context["country"],
         region=locator_context["region"],
         meta=meta,
+        vegetation_price_per_hectare=vegetation_price_per_hectare,
     )
 
     return Response(

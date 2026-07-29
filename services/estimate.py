@@ -64,19 +64,25 @@ def _scaled_buffer(pt, lon_radius_deg, lat_radius_deg, resolution=8):
     return scale(circle, xfact=lon_radius_deg, yfact=lat_radius_deg, origin=pt)
 
 
-def _polygon_area_km2(geom, features):
-    """Rough area in km^2 using an equirectangular approximation centered on
-    the detection centroid (good enough for the small areas this tool targets).
-    """
+def _area_km2_at_lat(geom, lat):
+    """Rough area in km^2 using an equirectangular approximation at the
+    given latitude (good enough for the small areas this tool targets)."""
     import math
     if geom.is_empty:
         return 0.0
-    lats = [f["geometry"]["coordinates"][1] for f in features]
-    mean_lat = sum(lats) / len(lats)
-    m_per_deg_lon = _METERS_PER_DEGREE_LAT * math.cos(math.radians(mean_lat))
+    m_per_deg_lon = _METERS_PER_DEGREE_LAT * math.cos(math.radians(lat))
     # geom.area is in square degrees; convert using local scale factors.
     area_m2 = geom.area * _METERS_PER_DEGREE_LAT * m_per_deg_lon
     return area_m2 / 1_000_000.0
+
+
+def _polygon_area_km2(geom, features):
+    """Same as _area_km2_at_lat, but derives the reference latitude from a
+    set of fire-detection features' mean latitude."""
+    if geom.is_empty or not features:
+        return 0.0
+    lats = [f["geometry"]["coordinates"][1] for f in features]
+    return _area_km2_at_lat(geom, sum(lats) / len(lats))
 
 
 def buildings_in_burnt_area(buildings_geojson, burnt_area_geojson):
@@ -94,6 +100,50 @@ def buildings_in_burnt_area(buildings_geojson, burnt_area_geojson):
             affected.append(feat)
 
     return affected, len(total), len(affected)
+
+
+def vegetation_in_burnt_area(vegetation_geojson, burnt_area_geojson):
+    """Clip vegetation/land-cover polygons (see services/landcover.py) to
+    the burnt area and total their area by category.
+
+    Returns (clipped_features, total_km2, by_category), where
+    clipped_features is a GeoJSON-feature list of just the portion of each
+    vegetation polygon that actually falls within the burnt area (so a map
+    layer built from it never draws vegetation extending outside the burn),
+    and by_category maps category -> km2.
+    """
+    features = vegetation_geojson.get("features", []) if vegetation_geojson else []
+    if not burnt_area_geojson or not features:
+        return [], 0.0, {}
+
+    burnt_geom = shape(burnt_area_geojson)
+    prepared_burnt = prep(burnt_geom)
+    mean_lat = burnt_geom.centroid.y
+
+    clipped_features = []
+    by_category = {}
+    for feat in features:
+        geom = shape(feat["geometry"])
+        if not prepared_burnt.intersects(geom):
+            continue
+        clipped = geom.intersection(burnt_geom)
+        if clipped.is_empty:
+            continue
+
+        area_km2 = _area_km2_at_lat(clipped, mean_lat)
+        category = feat.get("properties", {}).get("category", "other")
+        by_category[category] = by_category.get(category, 0.0) + area_km2
+        clipped_features.append({
+            "type": "Feature",
+            "geometry": mapping(clipped),
+            # area_km2 carried on the feature so downstream code (e.g. the
+            # report's per-municipality woodland-value table) doesn't have
+            # to re-derive it from the geometry a second time.
+            "properties": {"category": category, "area_km2": round(area_km2, 6)},
+        })
+
+    total_km2 = sum(by_category.values())
+    return clipped_features, total_km2, by_category
 
 
 def value_per_fire(fires_geojson, buildings_geojson, value_by_osm_id, source="VIIRS_SNPP_NRT", radius_m=None):

@@ -184,11 +184,12 @@ label {
   margin-bottom: 10px;
 }
 
-/* Scoped to #sidebar so this doesn't leak into third-party widgets that
-   also render <input> elements on the page -- e.g. Leaflet's layer-switcher
-   control uses plain radio inputs, which this rule used to turn into
-   full-width dark blocks with an unreadable/invisible radio indicator. */
-#sidebar input, #sidebar select {
+/* Scoped to #sidebar/.modal-panel so this doesn't leak into third-party
+   widgets that also render <input> elements on the page -- e.g. Leaflet's
+   layer-switcher control uses plain radio inputs, which this rule used to
+   turn into full-width dark blocks with an unreadable/invisible radio
+   indicator. */
+#sidebar input, #sidebar select, .modal-panel input, .modal-panel select {
   display: block;
   width: 100%;
   box-sizing: border-box;
@@ -282,9 +283,145 @@ button#save-example-btn:hover {
   color: #ff6b6b;
 }
 
-.disclaimer {
+.barplot {
+  margin: 4px 0 10px;
+}
+
+.barplot-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
   font-size: 11px;
-  color: #888;
-  margin-top: 20px;
-  line-height: 1.4;
+}
+
+.barplot-label {
+  width: 92px;
+  flex: 0 0 auto;
+  color: #ccc;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.barplot-track {
+  flex: 1 1 auto;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  height: 12px;
+  overflow: hidden;
+}
+
+.barplot-fill {
+  height: 100%;
+  border-radius: 3px;
+  min-width: 2px;
+}
+
+.barplot-value {
+  flex: 0 0 auto;
+  width: 62px;
+  text-align: right;
+  color: #eee;
+}
+
+.price-matrix {
+  margin-bottom: 10px;
+}
+
+.price-matrix-title {
+  font-size: 12px;
+  color: #ccc;
+  margin-bottom: 4px;
+}
+
+.price-matrix-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 8px;
+}
+
+.price-matrix-grid label {
+  margin-bottom: 0;
+  font-size: 11px;
+}
+
+.toolbar-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.toolbar-row button {
+  margin-bottom: 0;
+  background: #2a2f36;
+}
+
+.toolbar-row button:hover {
+  background: #343b44;
+}
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal.hidden {
+  display: none;
+}
+
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.modal-panel {
+  position: relative;
+  max-width: min(90vw, 420px);
+  max-height: 85vh;
+  overflow-y: auto;
+  background: #1b1f24;
+  color: #e6e6e6;
+  border: 1px solid #444;
+  border-radius: 8px;
+  padding: 20px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+}
+
+.modal-panel h3 {
+  margin: 0 0 14px;
+  font-size: 16px;
+}
+
+.modal-panel p {
+  font-size: 12px;
+  color: #ccc;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.modal-close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 28px;
+  margin: 0;
+  padding: 0;
+  background: none;
+  border: none;
+  color: #ccc;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.modal-close:hover {
+  background: #2a2f36;
+  color: #fff;
 }

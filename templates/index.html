@@ -42,8 +42,8 @@
       <input type="date" id="date-input">
     </label>
 
-    <label>Days to include (1&ndash;5)
-      <input type="number" id="days-input" min="1" max="5" value="1">
+    <label>Days to include (1&ndash;20)
+      <input type="number" id="days-input" min="1" max="20" value="1">
     </label>
 
     <label>Fire sensor
@@ -55,16 +55,20 @@
       </select>
     </label>
 
+    <div class="toolbar-row">
+      <button id="prices-btn" type="button">Prices&hellip;</button>
+      <button id="disclaimer-btn" type="button">Disclaimer</button>
+    </div>
+
     <div id="results" class="hidden">
       <h2>Results</h2>
       <div class="stat"><span id="stat-fires">0</span> active fire detections</div>
       <div class="stat"><span id="stat-area">0</span> km&sup2; estimated burnt area</div>
+      <div class="stat highlight"><span id="stat-vegetation-km2">0</span> km&sup2; forest/vegetation burnt</div>
+      <div id="vegetation-barplot" class="barplot"></div>
       <div class="stat"><span id="stat-buildings-total">0</span> buildings near burnt area</div>
       <div class="stat highlight"><span id="stat-buildings-affected">0</span> buildings estimated affected</div>
 
-      <label>Fallback price (&euro;/m&sup2;)
-        <input type="number" id="price-input" min="0" step="50" value="2700">
-      </label>
       <button id="valuation-btn" disabled>Estimate value lost (Spain)</button>
       <div id="valuation-results" class="hidden">
         <div class="stat highlight"><span id="stat-value-lost">0</span> &euro; estimated value lost</div>
@@ -79,21 +83,65 @@
 
       <button id="report-btn" disabled>Export report (PNG)</button>
     </div>
-
-    <p class="disclaimer">
-      Burnt area is a rough proxy built by buffering active-fire detections,
-      not an official burn-perimeter product. Building counts are estimates,
-      not a substitute for official damage assessments. Value-lost estimates
-      use real building areas from Spain's public Catastro service crossed
-      with an assumed price per m&sup2; (editable above) &mdash; Catastro
-      does not expose official assessed values to the public, and this is
-      not a substitute for a real appraisal. Only works for locations in
-      Spain; buildings without a cadastral match fall back to their OSM
-      footprint area (&times; floor count, when OSM has it) at the fallback price.
-    </p>
     </div>
 
     <div id="map"></div>
+  </div>
+
+  <div id="prices-modal" class="modal hidden">
+    <div class="modal-backdrop" data-close-modal></div>
+    <div class="modal-panel">
+      <button class="modal-close" type="button" aria-label="Close" data-close-modal>&times;</button>
+      <h3>Prices</h3>
+
+      <label>Fallback price, buildings (&euro;/m&sup2;)
+        <input type="number" id="price-input" min="0" step="50" value="2700">
+      </label>
+
+      <div class="price-matrix">
+        <div class="price-matrix-title">Vegetation price (&euro;/hectare)</div>
+        <div class="price-matrix-grid">
+          <label>Forest
+            <input type="number" id="price-forest-input" min="0" step="100" value="3000">
+          </label>
+          <label>Scrub / heath
+            <input type="number" id="price-scrub_heath-input" min="0" step="100" value="800">
+          </label>
+          <label>Grassland
+            <input type="number" id="price-grassland-input" min="0" step="100" value="2000">
+          </label>
+          <label>Farmland
+            <input type="number" id="price-farmland-input" min="0" step="100" value="6000">
+          </label>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="disclaimer-modal" class="modal hidden">
+    <div class="modal-backdrop" data-close-modal></div>
+    <div class="modal-panel">
+      <button class="modal-close" type="button" aria-label="Close" data-close-modal>&times;</button>
+      <h3>Disclaimer</h3>
+      <p>
+        Burnt area is a rough proxy built by buffering active-fire detections,
+        not an official burn-perimeter product. Forest/vegetation burnt is
+        estimated from OpenStreetMap land-cover tagging (forest, scrub/heath,
+        grassland, farmland) clipped to that same proxy &mdash; coverage and
+        categorization in OSM varies by area, so this is an estimate, not a
+        substitute for a real land-cover product. The report's vegetation-value
+        table prices each category's burnt area at the price/hectare set in
+        Prices &mdash; rough illustrative figures, not a market appraisal or
+        timber valuation. Building counts are estimates, not a substitute for
+        official damage assessments. Value-lost estimates use real building
+        areas from Spain's public Catastro service crossed with an assumed
+        price per m&sup2; (set in Prices) &mdash; Catastro does not expose
+        official assessed values to the public, and this is not a substitute
+        for a real appraisal. Only works for locations in Spain; buildings
+        without a cadastral match fall back to their OSM footprint area
+        (&times; floor count, when OSM has it) at the fallback price.
+      </p>
+    </div>
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>

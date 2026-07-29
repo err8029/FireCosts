@@ -8,6 +8,7 @@ personal data and only readable by the property owner through an
 authenticated session. See the free-services spec:
 https://www.catastro.hacienda.gob.es/ws/Webservices_Libres.pdf
 """
+import threading
 import xml.etree.ElementTree as ET
 
 import requests
@@ -66,6 +67,60 @@ class CatastroRateLimitError(RuntimeError):
     here' result -- retrying immediately won't help until the quota resets."""
 
 
+class _InFlight:
+    def __init__(self):
+        self.event = threading.Event()
+        self.result = None
+        self.exc = None
+
+
+_inflight_lock = threading.Lock()
+_inflight = {}
+
+
+def _single_flight(key, fetch):
+    """Ensure only one live request is ever in flight per key at a time --
+    valuation.py looks up every affected building concurrently (see its
+    MAX_WORKERS), and it's common for several OSM building features to
+    share the same point (duplicate geometry) or, far more often, the
+    same cadastral parcel reference (a multi-unit building's individual
+    wings/stairwells are frequently mapped as separate OSM ways, all
+    resolving to the same `rc`). Without this, two worker threads that
+    both reach a cache miss for the same key before either has finished
+    and cached its result would each fire their own live Catastro
+    request for identical data -- pure waste against an hourly per-IP
+    quota that's already the actual bottleneck on how many buildings a
+    large analysis can price.
+
+    Any thread that arrives after the first (the "leader") just waits for
+    the leader's result (or its exception, re-raised) instead of
+    duplicating the request.
+    """
+    with _inflight_lock:
+        existing = _inflight.get(key)
+        leader = existing is None
+        if leader:
+            existing = _InFlight()
+            _inflight[key] = existing
+
+    if not leader:
+        existing.event.wait()
+        if existing.exc is not None:
+            raise existing.exc
+        return existing.result
+
+    try:
+        existing.result = fetch()
+        return existing.result
+    except Exception as exc:
+        existing.exc = exc
+        raise
+    finally:
+        existing.event.set()
+        with _inflight_lock:
+            _inflight.pop(key, None)
+
+
 def _raise_for_status(resp):
     if resp.status_code == 403 and "limite de peticiones" in resp.text.lower():
         raise CatastroRateLimitError(
@@ -88,7 +143,8 @@ def lookup_reference(lon, lat, timeout=10):
     if cached is not catastro_cache.MISS:
         return cached
 
-    result = _lookup_reference_live(lon, lat, timeout)
+    key = ("reference", catastro_cache._reference_key(lon, lat))
+    result = _single_flight(key, lambda: _lookup_reference_live(lon, lat, timeout))
     catastro_cache.set_reference(lon, lat, result[0], result[1])
     return result
 
@@ -152,7 +208,7 @@ def lookup_details(rc, timeout=10):
     if cached is not catastro_cache.MISS:
         return cached
 
-    result = _lookup_details_live(rc, timeout)
+    result = _single_flight(("details", rc), lambda: _lookup_details_live(rc, timeout))
     catastro_cache.set_details(rc, result)
     return result
 

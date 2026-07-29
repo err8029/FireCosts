@@ -1,4 +1,11 @@
-const map = L.map("map").setView([40.4168, -3.7038], 11); // default: Madrid
+// Default: the whole Iberian Peninsula, not a single city -- gives the
+// user immediate context for where the active-fire pointers (see
+// loadActiveFiresOverview below) actually are, rather than starting
+// zoomed into Madrid and having the view jump right after load. Once the
+// overview fetch resolves it fits bounds to the real pointers anyway;
+// this is just a sane starting point (and the fallback view if that
+// fetch fails or finds nothing).
+const map = L.map("map").setView([40.0, -4.0], 6);
 
 const osmLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 19,
@@ -45,6 +52,24 @@ let currentBbox = null;
 let fireLayer = null;
 let burntAreaLayer = null;
 let buildingsLayer = null;
+let vegetationLayer = null;
+let activeFiresOverviewLayer = null;
+
+// Vegetation/land-cover categories from services/landcover.py, colored
+// distinctly from the burnt-area/building layers so they read as a
+// separate "what kind of land" layer rather than more burnt-area shading.
+const VEGETATION_COLORS = {
+  forest: "#2e7d32",
+  scrub_heath: "#8d6e29",
+  grassland: "#9ccc65",
+  farmland: "#d4b106",
+};
+const VEGETATION_LABELS = {
+  forest: "Forest / woodland",
+  scrub_heath: "Scrub / heath",
+  grassland: "Grassland / meadow",
+  farmland: "Farmland",
+};
 
 let lastAffectedBuildings = null;
 let lastAnalysis = null;
@@ -62,6 +87,10 @@ const daysInput = document.getElementById("days-input");
 const sourceInput = document.getElementById("source-input");
 const resultsEl = document.getElementById("results");
 const priceInput = document.getElementById("price-input");
+const VEGETATION_CATEGORIES = ["forest", "scrub_heath", "grassland", "farmland"];
+const vegetationPriceInputs = Object.fromEntries(
+  VEGETATION_CATEGORIES.map((cat) => [cat, document.getElementById(`price-${cat}-input`)])
+);
 const valuationBtn = document.getElementById("valuation-btn");
 const valuationResultsEl = document.getElementById("valuation-results");
 const reportBtn = document.getElementById("report-btn");
@@ -85,6 +114,31 @@ sidebarToggleBtn.addEventListener("click", () => {
 });
 
 sidebarBackdrop.addEventListener("click", () => setSidebarOpen(false));
+
+// Prices and Disclaimer are floating popups rather than always-visible
+// sidebar content -- keeps the sidebar from accumulating every input and
+// paragraph of fine print as features (vegetation, per-category pricing)
+// get added over time.
+function openModal(modal) {
+  modal.classList.remove("hidden");
+}
+function closeModal(modal) {
+  modal.classList.add("hidden");
+}
+document.querySelectorAll(".modal").forEach((modal) => {
+  modal.querySelectorAll("[data-close-modal]").forEach((el) => {
+    el.addEventListener("click", () => closeModal(modal));
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !modal.classList.contains("hidden")) closeModal(modal);
+  });
+});
+document.getElementById("prices-btn").addEventListener("click", () => {
+  openModal(document.getElementById("prices-modal"));
+});
+document.getElementById("disclaimer-btn").addEventListener("click", () => {
+  openModal(document.getElementById("disclaimer-modal"));
+});
 
 const RECENT_BOXES_KEY = "fireAnalysisRecentBoxes";
 const CUSTOM_EXAMPLES_KEY = "fireAnalysisCustomExamples";
@@ -202,6 +256,15 @@ function applyBbox(bbox) {
   const [west, south, east, north] = bbox;
   currentBbox = bbox;
 
+  // The overview pointers were only ever a guide for where to draw --
+  // once the user has an actual area of interest, they'd just clutter
+  // the map (and can visually overlap the real per-detection fire
+  // markers Analyze renders inside this box).
+  if (activeFiresOverviewLayer) {
+    map.removeLayer(activeFiresOverviewLayer);
+    activeFiresOverviewLayer = null;
+  }
+
   drawnItems.clearLayers();
   const rect = L.rectangle([[south, west], [north, east]], { color: "#2b6cb0" });
   drawnItems.addLayer(rect);
@@ -255,6 +318,10 @@ drawBoxBtn.addEventListener("click", () => {
 });
 
 map.on(L.Draw.Event.CREATED, (e) => {
+  if (activeFiresOverviewLayer) {
+    map.removeLayer(activeFiresOverviewLayer);
+    activeFiresOverviewLayer = null;
+  }
   drawnItems.clearLayers();
   const layer = e.layer;
   drawnItems.addLayer(layer);
@@ -279,6 +346,28 @@ function setStatus(msg, isError) {
   toastEl.classList.remove("hidden");
 }
 
+// The backend can't report real incremental progress on a single
+// synchronous request/response, so this shows an estimated percentage
+// instead: fast at first, easing off and capping below 100% for as long
+// as the request is still in flight, so a slow analysis/report doesn't
+// just sit on a static "..." with no sense of whether it's still working.
+// stepSeconds is how long it should take to visually approach the cap
+// under normal conditions -- tuned per operation below, not a guarantee.
+function startProgress(baseMessage, stepSeconds = 8) {
+  let pct = 0;
+  const cap = 92;
+  const update = () => setStatus(`${baseMessage} (${Math.round(pct)}%)`);
+  update();
+  const stepMs = 200;
+  const steps = (stepSeconds * 1000) / stepMs;
+  const timer = setInterval(() => {
+    pct += ((cap - pct) / steps) * 3;
+    if (pct > cap) pct = cap;
+    update();
+  }, stepMs);
+  return () => clearInterval(timer);
+}
+
 async function parseJsonResponse(resp) {
   const text = await resp.text();
   try {
@@ -293,11 +382,110 @@ async function parseJsonResponse(resp) {
   }
 }
 
+// Looking back this many days (including today) for the pre-draw fire
+// pointers -- long enough that a multi-day fire shows a real "detected
+// since ..." range instead of always just "today" (FIRMS's day_range
+// counts forward from a start date, so this needs to start in the past
+// to cover it), short enough to stay a "what's currently active" guide
+// rather than a historical archive.
+const OVERVIEW_DAY_RANGE = 6;
+
+function isoDaysAgo(days) {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return d.toISOString().slice(0, 10);
+}
+
+function daysBetweenInclusive(startIso, endIso) {
+  const start = new Date(startIso);
+  const end = new Date(endIso);
+  return Math.round((end - start) / 86400000) + 1;
+}
+
+// Shown on first load, before the user has drawn any box: rough pointers
+// for where active fires currently are across Spain (e.g. one near
+// "Sierra Oeste"), fetched once from FIRMS via /api/active-fires-overview
+// so the user has somewhere to start instead of an empty map. Cleared as
+// soon as they pick an actual area (see applyBbox / the CREATED handler
+// above) since its only job is to guide that first choice.
+async function loadActiveFiresOverview() {
+  const overviewStart = isoDaysAgo(OVERVIEW_DAY_RANGE - 1);
+  try {
+    const resp = await fetch(
+      `/api/active-fires-overview?start=${overviewStart}&days=${OVERVIEW_DAY_RANGE}`
+    );
+    const data = await parseJsonResponse(resp);
+    if (!resp.ok || !data.clusters || !data.clusters.length) return;
+
+    activeFiresOverviewLayer = L.layerGroup(
+      data.clusters.map((cluster) => {
+        const radius = Math.min(9, Math.max(6, Math.sqrt(cluster.count) * 2));
+        let dateText = "";
+        if (cluster.start_date && cluster.end_date && cluster.start_date !== cluster.end_date) {
+          dateText = `Detected ${cluster.start_date} → ${cluster.end_date}`;
+        } else if (cluster.start_date) {
+          dateText = `Detected ${cluster.start_date}`;
+        }
+        return L.circleMarker([cluster.lat, cluster.lon], {
+          radius,
+          color: "#ff3d00",
+          weight: 2,
+          fillColor: "#ff9f1c",
+          fillOpacity: 0.55,
+          dashArray: "3,3",
+        }).bindPopup(
+          `<strong>${cluster.label || "Unnamed area"}</strong><br>` +
+          `~${cluster.count} fire detection${cluster.count === 1 ? "" : "s"}` +
+          (cluster.max_frp ? `, up to ${cluster.max_frp.toFixed(1)} MW radiative power` : "") +
+          (dateText ? `<br>${dateText}` : "") +
+          `<br><em>Click to zoom in and suggest an analysis box here.</em>`
+        // Shown on hover, not just on click -- clicking now takes the
+        // action (zoom + suggest a box), so the user needs to see what a
+        // pointer actually is *before* committing to that, not just
+        // after.
+        ).on("mouseover", (e) => e.target.openPopup())
+        .on("mouseout", (e) => e.target.closePopup())
+        .on("click", () => {
+          // Suggest a box sized to this fire's own detections (see
+          // firms.cluster_fires' bbox padding) and zoom to it, same as
+          // picking a box from the dropdown or drawing one by hand.
+          applyBbox(cluster.bbox);
+          // Match the date range to what this fire actually showed up
+          // in, so clicking Analyze immediately re-fetches the right
+          // window instead of silently defaulting to a single day that
+          // might miss most of the fire's detections.
+          if (cluster.start_date) {
+            dateInput.value = cluster.start_date;
+            daysInput.value = Math.max(
+              1, Math.min(20, daysBetweenInclusive(cluster.start_date, cluster.end_date))
+            );
+          }
+          setStatus("Box suggested from this fire's detections — adjust if needed, then Analyze.");
+        });
+      })
+    ).addTo(map);
+
+    // Pointers are only useful if the user can actually see them without
+    // hunting -- the map otherwise defaults to a fixed Madrid view that
+    // may not contain any of today's fires at all. Only do this on the
+    // initial load (currentBbox is still unset at this point; a user who
+    // has since drawn/selected a box gets to keep their own view).
+    if (!currentBbox) {
+      const bounds = L.latLngBounds(data.clusters.map((c) => [c.lat, c.lon]));
+      map.fitBounds(bounds, { padding: [40, 40], maxZoom: 9 });
+    }
+  } catch {
+    // Best-effort guide layer -- a failed fetch (e.g. NASA FIRMS/Overpass
+    // unreachable) just means no pointers show up yet, not an error the
+    // user needs to see; they can still draw a box manually as before.
+  }
+}
+
 function clearResultLayers() {
-  [fireLayer, burntAreaLayer, buildingsLayer].forEach((layer) => {
+  [fireLayer, burntAreaLayer, buildingsLayer, vegetationLayer].forEach((layer) => {
     if (layer) map.removeLayer(layer);
   });
-  fireLayer = burntAreaLayer = buildingsLayer = null;
+  fireLayer = burntAreaLayer = buildingsLayer = vegetationLayer = null;
 }
 
 async function runAnalysis() {
@@ -312,7 +500,6 @@ async function runAnalysis() {
   });
 
   analyzeBtn.disabled = true;
-  setStatus("Fetching active fires and buildings…");
   clearResultLayers();
   resultsEl.classList.add("hidden");
   valuationResultsEl.classList.add("hidden");
@@ -321,6 +508,13 @@ async function runAnalysis() {
   lastValuation = null;
   reportBtn.disabled = true;
 
+  // Scales with the day range: fetching more days of fire detections
+  // (and the buildings/vegetation near a potentially larger burnt area)
+  // genuinely takes longer, so the progress estimate should too.
+  const stopProgress = startProgress(
+    "Fetching active fires, buildings and vegetation…",
+    6 + Number(daysInput.value) * 2,
+  );
   try {
     const resp = await fetch(`/api/estimate?${params.toString()}`);
     const data = await parseJsonResponse(resp);
@@ -339,18 +533,69 @@ async function runAnalysis() {
     renderResults(data);
     reportBtn.disabled = false;
     rememberBbox(currentBbox, dateInput.value);
+    stopProgress();
     setStatus("");
   } catch (err) {
+    stopProgress();
     setStatus(err.message, true);
   } finally {
     analyzeBtn.disabled = false;
   }
 }
 
+function renderVegetationBarplot(byCategory) {
+  const container = document.getElementById("vegetation-barplot");
+  container.innerHTML = "";
+
+  const entries = Object.entries(byCategory).sort((a, b) => b[1] - a[1]);
+  if (!entries.length) return;
+
+  const maxValue = entries[0][1] || 1;
+  entries.forEach(([category, km2]) => {
+    const color = VEGETATION_COLORS[category] || "#777";
+    const row = document.createElement("div");
+    row.className = "barplot-row";
+
+    const label = document.createElement("div");
+    label.className = "barplot-label";
+    label.textContent = VEGETATION_LABELS[category] || category;
+
+    const track = document.createElement("div");
+    track.className = "barplot-track";
+    const fill = document.createElement("div");
+    fill.className = "barplot-fill";
+    fill.style.width = `${Math.max((km2 / maxValue) * 100, 2)}%`;
+    fill.style.backgroundColor = color;
+    track.appendChild(fill);
+
+    const value = document.createElement("div");
+    value.className = "barplot-value";
+    value.textContent = `${km2} km²`;
+
+    row.append(label, track, value);
+    container.appendChild(row);
+  });
+}
+
 function renderResults(data) {
   if (data.burnt_area) {
     burntAreaLayer = L.geoJSON(data.burnt_area, {
       style: { color: "#ff6b6b", weight: 1, fillOpacity: 0.25 },
+    }).addTo(map);
+  }
+
+  if (data.burnt_vegetation && data.burnt_vegetation.features.length) {
+    vegetationLayer = L.geoJSON(data.burnt_vegetation, {
+      style: (feature) => ({
+        color: VEGETATION_COLORS[feature.properties.category] || "#666",
+        weight: 1,
+        fillColor: VEGETATION_COLORS[feature.properties.category] || "#666",
+        fillOpacity: 0.45,
+      }),
+      onEachFeature: (feature, layer) => {
+        const label = VEGETATION_LABELS[feature.properties.category] || feature.properties.category;
+        layer.bindPopup(label);
+      },
     }).addTo(map);
   }
 
@@ -374,6 +619,8 @@ function renderResults(data) {
 
   document.getElementById("stat-fires").textContent = data.fires.features.length;
   document.getElementById("stat-area").textContent = data.burnt_area_km2;
+  document.getElementById("stat-vegetation-km2").textContent = data.vegetation_burnt_km2 ?? 0;
+  renderVegetationBarplot(data.vegetation_by_category || {});
   document.getElementById("stat-buildings-total").textContent = data.buildings_total;
   document.getElementById("stat-buildings-affected").textContent = data.buildings_affected;
   resultsEl.classList.remove("hidden");
@@ -390,7 +637,13 @@ async function runValuation() {
   if (!lastAffectedBuildings || !lastAffectedBuildings.features.length) return;
 
   valuationBtn.disabled = true;
-  setStatus("Looking up Catastro records for affected buildings…");
+  // Catastro lookups run 6 at a time (see valuation.py), so wall-clock
+  // time scales roughly with buildings/6, not the raw count.
+  const buildingCount = lastAffectedBuildings.features.length;
+  const stopProgress = startProgress(
+    "Looking up Catastro records for affected buildings…",
+    4 + (buildingCount / 6) * 1.5,
+  );
 
   try {
     const resp = await fetch("/api/valuation", {
@@ -408,8 +661,10 @@ async function runValuation() {
     }
 
     renderValuation(data);
+    stopProgress();
     setStatus("");
   } catch (err) {
+    stopProgress();
     setStatus(err.message, true);
   } finally {
     valuationBtn.disabled = false;
@@ -467,7 +722,11 @@ async function exportReport() {
   if (!lastAnalysis || !lastMeta) return;
 
   reportBtn.disabled = true;
-  setStatus("Rendering report…");
+  // Dominated by the municipality/locator Overpass lookups, which are
+  // bounded by the backend's own ~12s deadline (see app.py), plus basemap
+  // tiles and rendering -- 15s covers the common case without the
+  // estimate racing too far ahead of a fast, cache-hit response.
+  const stopProgress = startProgress("Rendering report…", 15);
 
   try {
     const resp = await fetch("/api/report", {
@@ -477,6 +736,14 @@ async function exportReport() {
         fires: lastAnalysis.fires,
         burnt_area: lastAnalysis.burnt_area,
         affected_buildings: lastAnalysis.affected_buildings,
+        burnt_vegetation: lastAnalysis.burnt_vegetation,
+        vegetation_burnt_km2: lastAnalysis.vegetation_burnt_km2,
+        vegetation_by_category: lastAnalysis.vegetation_by_category,
+        vegetation_price_per_hectare: Object.fromEntries(
+          VEGETATION_CATEGORIES
+            .map((cat) => [cat, Number(vegetationPriceInputs[cat].value)])
+            .filter(([, value]) => !Number.isNaN(value))
+        ),
         valuation: lastValuation,
         meta: { ...lastMeta, basemap: currentBasemap },
       }),
@@ -496,8 +763,10 @@ async function exportReport() {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+    stopProgress();
     setStatus("");
   } catch (err) {
+    stopProgress();
     setStatus(err.message, true);
   } finally {
     reportBtn.disabled = false;
@@ -507,3 +776,5 @@ async function exportReport() {
 analyzeBtn.addEventListener("click", runAnalysis);
 valuationBtn.addEventListener("click", runValuation);
 reportBtn.addEventListener("click", exportReport);
+
+loadActiveFiresOverview();
