@@ -8,7 +8,7 @@ from concurrent.futures import wait as futures_wait
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request, Response
-from shapely.geometry import shape
+from shapely.geometry import box, shape
 from shapely.ops import unary_union
 from werkzeug.exceptions import HTTPException
 
@@ -263,12 +263,24 @@ def api_estimate():
         # realistic to complete, still returning the fire/burnt-area data
         # itself (FIRMS + local geometry math, not Overpass, so
         # unaffected by any of this).
-        MAX_QUERY_BBOX_DEG2 = float(os.environ.get("ESTIMATE_MAX_QUERY_BBOX_DEG2", 0.1))
-        query_area_deg2 = (query_bbox[2] - query_bbox[0]) * (query_bbox[3] - query_bbox[1])
-        if query_area_deg2 > MAX_QUERY_BBOX_DEG2:
+        #
+        # Compared in real km2, not raw degrees2: a degrees2 box doesn't
+        # translate to a fixed real area (longitude compresses with
+        # latitude), and -- more importantly -- this bbox is the *bounding
+        # box* of the burnt area, not the burnt area itself, so for a
+        # sprawling/disjoint fire it can be far bigger than the burnt km2
+        # shown to the user (confirmed directly: that same ~270km2 fire's
+        # own bounding box works out to ~1826km2, nearly 7x its actual
+        # burnt footprint) -- comparing in km2 and showing both numbers in
+        # the message below is what actually explains why a fire that
+        # "looks like" only 270km2 still got skipped.
+        mean_lat = (south + north) / 2
+        query_area_km2 = estimate_service._area_km2_at_lat(box(*query_bbox), mean_lat)
+        MAX_QUERY_BBOX_KM2 = float(os.environ.get("ESTIMATE_MAX_QUERY_BBOX_KM2", 3000))
+        if query_area_km2 > MAX_QUERY_BBOX_KM2:
             logger.info(
-                "Skipping buildings/vegetation lookup: burnt-area query bbox (%.4f deg2) exceeds cap (%.4f)",
-                query_area_deg2, MAX_QUERY_BBOX_DEG2,
+                "Skipping buildings/vegetation lookup: burnt-area query bbox (%.1f km2) exceeds cap (%.1f)",
+                query_area_km2, MAX_QUERY_BBOX_KM2,
             )
             return jsonify({
                 "fires": fires,
@@ -282,10 +294,12 @@ def api_estimate():
                 "burnt_vegetation": {"type": "FeatureCollection", "features": []},
                 "buildings_vegetation_skipped": True,
                 "buildings_vegetation_skip_reason": (
-                    f"This burnt area ({round(area_km2)} km²) is too large for a live "
-                    "building/vegetation lookup. Fire detections and the burnt-area "
-                    "estimate above are still accurate; try a smaller box or a shorter "
-                    "day range for building/vegetation stats."
+                    f"This fire's burnt area is {round(area_km2)} km², but a sprawling or "
+                    f"multi-day fire can spread across far more ground than its actual "
+                    f"burnt footprint -- here, roughly {round(query_area_km2)} km², too "
+                    "large for a live building/vegetation lookup. Fire detections and the "
+                    "burnt-area estimate above are still accurate; try a smaller box or a "
+                    "shorter day range for building/vegetation stats."
                 ),
             })
 
