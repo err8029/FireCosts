@@ -43,7 +43,7 @@ _retry = Retry(
 _session.mount("https://", HTTPAdapter(max_retries=_retry))
 
 
-def query(data, timeout=30):
+def query(data, timeout=60):
     """POST an Overpass QL query, trying each known public endpoint in turn,
     sharing one overall wall-clock budget across all of them so the total
     time this can take is bounded by `timeout` regardless of how many

@@ -239,7 +239,7 @@ def api_estimate():
         # so this mainly buys a bit more room for a mirror that's merely
         # slow rather than fully unreachable, without pretending a longer
         # wait fixes a connection that was never going to succeed.
-        FETCH_DEADLINE_S = int(os.environ.get("ESTIMATE_FETCH_DEADLINE_S", 60))
+        FETCH_DEADLINE_S = int(os.environ.get("ESTIMATE_FETCH_DEADLINE_S", 80))
         pool = ThreadPoolExecutor(max_workers=4)
         # Both calls' own internal Overpass timeout is pinned to this same
         # deadline explicitly -- their defaults used to disagree wildly
@@ -247,9 +247,9 @@ def api_estimate():
         # *own* query could quietly give up and return empty well before
         # the outer deadline here was ever reached, independent of how
         # patient this deadline actually was.
-        buildings_future = pool.submit(buildings_service.fetch_buildings, query_bbox, timeout=FETCH_DEADLINE_S)
         vegetation_future = pool.submit(landcover_service.fetch_vegetation, query_bbox, timeout=FETCH_DEADLINE_S)
-
+        buildings_future = pool.submit(buildings_service.fetch_buildings, query_bbox, timeout=FETCH_DEADLINE_S)
+        
         futures_wait([buildings_future, vegetation_future], timeout=FETCH_DEADLINE_S)
 
         if not buildings_future.done():
