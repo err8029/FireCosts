@@ -136,9 +136,8 @@ def fetch_tiled(bbox, fetch_tile, dedup_key, timeout, max_tile_deg=0.05, split_a
         throughput -- it just means more of the tiles collide with that
         limit and get rejected, which looks identical to "Overpass is
         down" from the caller's side even though a single request would
-        have worked. Lighter per-tile queries (e.g.
-        buildings.fetch_building_centers' `out center`) don't change this
-        -- the constraint is connection count, not query weight.
+        have worked. A lighter per-tile query doesn't change this -- the
+        constraint is connection count, not query weight.
 
     Returns (features, tiles_ok, tiles_total). When bbox needed splitting
     (tiles_total > 1), this never raises itself -- if every tile fails,

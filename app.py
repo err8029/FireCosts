@@ -231,7 +231,6 @@ def api_estimate():
 
     burnt_area, area_km2 = estimate_service.build_burnt_area(fires, source=source)
 
-    buildings_lightweight = False
     if burnt_area is None:
         # Nothing burning in this box -- no building or vegetation stat can
         # be "affected", so skip both OSM queries entirely instead of
@@ -258,28 +257,18 @@ def api_estimate():
         # merging at even a very tight ~500m radius only cut total area
         # by ~8% for that fire, because the detections themselves are
         # spread almost continuously across the whole extent, not in a
-        # few tight clusters with big empty gaps between them.
-        #
-        # Past MAX_QUERY_BBOX_DEG2, a *full-footprint* fetch (every node
-        # of every building's outline) is no longer realistic -- but the
-        # value estimate itself doesn't actually need outlines, just a
-        # point per building for Catastro to look up (see
-        # buildings.fetch_building_centers, using Overpass's `out center`
-        # instead of resolving full geometry). That stays viable much
-        # further out, so it's used up to MAX_QUERY_BBOX_DEG2_LIGHTWEIGHT
-        # instead of giving up immediately -- the tradeoff is buildings
-        # render as markers instead of real outlines (see map.js/
-        # report.py, both already handle a Point feature). Only past the
-        # lightweight cap too does this skip the live lookup outright,
-        # still returning the fire/burnt-area data itself (FIRMS + local
-        # geometry math, not Overpass, so unaffected by any of this).
+        # few tight clusters with big empty gaps between them. Past this
+        # size, skip the live lookup outright with a clear reason instead
+        # of attempting (and eventually failing) a fetch that was never
+        # realistic to complete, still returning the fire/burnt-area data
+        # itself (FIRMS + local geometry math, not Overpass, so
+        # unaffected by any of this).
         MAX_QUERY_BBOX_DEG2 = float(os.environ.get("ESTIMATE_MAX_QUERY_BBOX_DEG2", 0.1))
-        MAX_QUERY_BBOX_DEG2_LIGHTWEIGHT = float(os.environ.get("ESTIMATE_MAX_QUERY_BBOX_DEG2_LIGHTWEIGHT", 1.0))
         query_area_deg2 = (query_bbox[2] - query_bbox[0]) * (query_bbox[3] - query_bbox[1])
-        if query_area_deg2 > MAX_QUERY_BBOX_DEG2_LIGHTWEIGHT:
+        if query_area_deg2 > MAX_QUERY_BBOX_DEG2:
             logger.info(
-                "Skipping buildings/vegetation lookup: burnt-area query bbox (%.4f deg2) exceeds lightweight cap (%.4f)",
-                query_area_deg2, MAX_QUERY_BBOX_DEG2_LIGHTWEIGHT,
+                "Skipping buildings/vegetation lookup: burnt-area query bbox (%.4f deg2) exceeds cap (%.4f)",
+                query_area_deg2, MAX_QUERY_BBOX_DEG2,
             )
             return jsonify({
                 "fires": fires,
@@ -291,16 +280,14 @@ def api_estimate():
                 "vegetation_burnt_km2": 0.0,
                 "vegetation_by_category": {},
                 "burnt_vegetation": {"type": "FeatureCollection", "features": []},
-                "buildings_lightweight": False,
                 "buildings_vegetation_skipped": True,
                 "buildings_vegetation_skip_reason": (
                     f"This burnt area ({round(area_km2)} km²) is too large for a live "
-                    "building/vegetation lookup, even a lightweight one. Fire detections "
-                    "and the burnt-area estimate above are still accurate; try a smaller "
-                    "box or a shorter day range for building/vegetation stats."
+                    "building/vegetation lookup. Fire detections and the burnt-area "
+                    "estimate above are still accurate; try a smaller box or a shorter "
+                    "day range for building/vegetation stats."
                 ),
             })
-        buildings_lightweight = query_area_deg2 > MAX_QUERY_BBOX_DEG2
 
         # Buildings and vegetation are independent OSM queries -- fetch
         # them concurrently rather than back to back. A hard wall-clock
@@ -351,19 +338,10 @@ def api_estimate():
         # abandoned request die off quickly instead of lingering.
         TILE_TIMEOUT_S = int(os.environ.get("ESTIMATE_TILE_TIMEOUT_S", 20))
         pool = ThreadPoolExecutor(max_workers=4)
-        # In lightweight mode, vegetation isn't even attempted: unlike
-        # buildings (Catastro supplies real area independent of OSM
-        # geometry), vegetation's *only* source of area is the OSM
-        # polygon itself, so there's no lighter version of that query --
-        # and at this size it's very unlikely to finish in time anyway.
-        if buildings_lightweight:
-            buildings_future = pool.submit(buildings_service.fetch_building_centers, query_bbox, timeout=TILE_TIMEOUT_S)
-            vegetation_future = None
-        else:
-            vegetation_future = pool.submit(landcover_service.fetch_vegetation, query_bbox, timeout=TILE_TIMEOUT_S)
-            buildings_future = pool.submit(buildings_service.fetch_buildings, query_bbox, timeout=TILE_TIMEOUT_S)
+        vegetation_future = pool.submit(landcover_service.fetch_vegetation, query_bbox, timeout=TILE_TIMEOUT_S)
+        buildings_future = pool.submit(buildings_service.fetch_buildings, query_bbox, timeout=TILE_TIMEOUT_S)
 
-        futures_wait([f for f in (buildings_future, vegetation_future) if f is not None], timeout=FETCH_DEADLINE_S)
+        futures_wait([buildings_future, vegetation_future], timeout=FETCH_DEADLINE_S)
 
         if not buildings_future.done():
             pool.shutdown(wait=False)
@@ -378,9 +356,7 @@ def api_estimate():
             pool.shutdown(wait=False)
             return jsonify({"error": str(exc)}), 400
 
-        if vegetation_future is None:
-            vegetation_geojson = {"type": "FeatureCollection", "features": []}
-        elif vegetation_future.done():
+        if vegetation_future.done():
             try:
                 vegetation_geojson = vegetation_future.result()
             except landcover_service.LandcoverError:
@@ -408,7 +384,6 @@ def api_estimate():
         "vegetation_burnt_km2": round(vegetation_km2, 3),
         "vegetation_by_category": {k: round(v, 3) for k, v in vegetation_by_category.items()},
         "burnt_vegetation": {"type": "FeatureCollection", "features": vegetation_features},
-        "buildings_lightweight": buildings_lightweight,
     })
 
 

@@ -14,14 +14,6 @@ from services import overpass
 # the hosting platform's own gateway timeout with an opaque 502.
 MAX_BBOX_DEG2 = 0.5  # roughly a ~50km x 50km box at mid-latitudes
 
-# Separate, more generous ceiling for fetch_building_centers below: an
-# `out center` query is far cheaper than resolving full footprints, so it
-# stays viable well past MAX_BBOX_DEG2 -- this just needs to be at least
-# as large as app.py's ESTIMATE_MAX_QUERY_BBOX_DEG2_LIGHTWEIGHT (default
-# 1.0) so *that* cap is the one actually deciding when to give up, not
-# this one cutting it off first.
-MAX_BBOX_DEG2_LIGHTWEIGHT = 2.0
-
 # In-memory cache keyed by (rounded) bbox: re-analyzing the same box -- e.g.
 # via the "recent boxes" shortcut, or just changing the date/day-range and
 # re-running -- is common, and OSM building footprints don't change on that
@@ -31,12 +23,6 @@ MAX_BBOX_DEG2_LIGHTWEIGHT = 2.0
 _CACHE_TTL_SECONDS = 20 * 60
 _cache = {}
 _cache_lock = threading.Lock()
-
-# Separate cache for fetch_building_centers below -- keyed the same way,
-# but must not be shared with the full-footprint cache: same bbox, very
-# different feature shape (Point vs Polygon).
-_centers_cache = {}
-_centers_cache_lock = threading.Lock()
 
 
 class BuildingsError(RuntimeError):
@@ -162,115 +148,4 @@ def fetch_buildings(bbox, timeout=60):
     if tiles_ok == tiles_total:
         with _cache_lock:
             _cache[key] = (time.time(), result)
-    return {"type": result["type"], "features": list(result["features"])}
-
-
-def _parse_building_centers_response(data):
-    features = []
-    for el in data.get("elements", []):
-        center = el.get("center")
-        if not center:
-            continue
-        tags = el.get("tags", {})
-        features.append({
-            "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [center["lon"], center["lat"]]},
-            "properties": {
-                "osm_id": el["id"],
-                "building": tags.get("building", "yes"),
-                "name": tags.get("name"),
-                "addr_housenumber": tags.get("addr:housenumber"),
-                "addr_street": tags.get("addr:street"),
-                "addr_city": tags.get("addr:city") or tags.get("addr:town") or tags.get("addr:village"),
-                "building_levels": tags.get("building:levels"),
-            },
-        })
-    return features
-
-
-def _fetch_building_centers_tile(tile_bbox, timeout):
-    west, south, east, north = tile_bbox
-    bbox_str = f"{south},{west},{north},{east}"
-    query = f"""
-    [out:json][timeout:{timeout}];
-    (
-      way["building"]({bbox_str});
-      relation["building"]({bbox_str});
-    );
-    out center;
-    """
-    resp = overpass.query(query, timeout=timeout + 10)
-    return _parse_building_centers_response(resp.json())
-
-
-def fetch_building_centers(bbox, timeout=60, max_tile_deg=0.15):
-    """Lightweight variant of fetch_buildings: each building comes back as
-    a single Point (Overpass's own computed center via `out center`)
-    instead of its full footprint polygon.
-
-    For a burnt area too large for fetch_buildings to realistically finish
-    (see app.py's ESTIMATE_MAX_QUERY_BBOX_DEG2) -- `out center` skips
-    resolving and transmitting every node of every building's outline
-    entirely, which is the bulk of the cost for a large area, so this
-    stays viable well past the point a full-footprint fetch would time
-    out. The tradeoff: no real outline to draw on the map/report (they
-    render as small markers instead, see map.js/report.py -- both already
-    handle a Point feature gracefully) and no OSM footprint area to fall
-    back on for a building with no Catastro match (see
-    valuation._footprint_area_m2's Point-geometry fallback) -- but
-    everything that actually drives the value estimate still works: which
-    buildings fall inside the burnt area, and a point Catastro can look up
-    for real built area and price.
-
-    Uses a larger default tile size than fetch_buildings -- each tile is
-    far cheaper now, so fewer, bigger tiles means fewer total requests for
-    the same (already large) area.
-    """
-    if _bbox_area(bbox) > MAX_BBOX_DEG2_LIGHTWEIGHT:
-        raise BuildingsError(
-            "Selected area is too large for a live OSM building query. "
-            "Please zoom in / draw a smaller box."
-        )
-
-    key = _cache_key(bbox)
-    with _centers_cache_lock:
-        cached = _centers_cache.get(key)
-    if cached is not None:
-        cached_at, result = cached
-        if time.time() - cached_at <= _CACHE_TTL_SECONDS:
-            return {"type": result["type"], "features": list(result["features"])}
-
-    try:
-        features, tiles_ok, tiles_total = overpass.fetch_tiled(
-            bbox,
-            fetch_tile=lambda tile_bbox: _fetch_building_centers_tile(tile_bbox, timeout),
-            dedup_key=lambda feat: feat["properties"]["osm_id"],
-            timeout=timeout,
-            max_tile_deg=max_tile_deg,
-            # Left at fetch_tiled's own default -- confirmed directly that
-            # raising this doesn't help even for a cheap `out center`
-            # query: the limiting factor is Overpass's own per-client
-            # concurrent-connection cap, not how light each individual
-            # query is (see fetch_tiled's docstring).
-        )
-    except requests.exceptions.Timeout as exc:
-        raise BuildingsError(
-            "OpenStreetMap's building data service (Overpass) did not respond in time. "
-            "Try a smaller area, or try again shortly."
-        ) from exc
-    except requests.RequestException as exc:
-        raise BuildingsError(
-            f"Could not fetch OSM buildings right now (Overpass: {exc}). Try again shortly."
-        ) from exc
-
-    if tiles_ok == 0:
-        raise BuildingsError(
-            "OpenStreetMap's building data service (Overpass) did not respond in time. "
-            "Try a smaller area, or try again shortly."
-        )
-
-    result = {"type": "FeatureCollection", "features": features}
-    if tiles_ok == tiles_total:
-        with _centers_cache_lock:
-            _centers_cache[key] = (time.time(), result)
     return {"type": result["type"], "features": list(result["features"])}

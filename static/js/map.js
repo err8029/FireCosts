@@ -593,18 +593,8 @@ async function runAnalysis() {
     // a live building/vegetation lookup (see app.py's /api/estimate) --
     // fires and the burnt-area estimate are still fully valid, just
     // missing the building/vegetation cross-reference, so this is a
-    // heads-up, not an error. buildings_lightweight: still got a real
-    // value estimate, just as points instead of building outlines.
-    if (data.buildings_vegetation_skipped) {
-      setStatus(data.buildings_vegetation_skip_reason);
-    } else if (data.buildings_lightweight) {
-      setStatus(
-        "This burnt area is large, so buildings are shown as points instead of full " +
-        "outlines -- the value estimate is still based on real Catastro data."
-      );
-    } else {
-      setStatus("");
-    }
+    // heads-up, not an error.
+    setStatus(data.buildings_vegetation_skipped ? data.buildings_vegetation_skip_reason : "");
   } catch (err) {
     stopProgress();
     setStatus(err.message, true);
@@ -685,13 +675,6 @@ function renderResults(data) {
 
   buildingsLayer = L.geoJSON(data.affected_buildings, {
     style: { color: "#00e5ff", weight: 3, fillColor: "#00e5ff", fillOpacity: 0.08 },
-    // Only used for Point features -- a large-area analysis gets building
-    // centers instead of full footprints (see app.py's
-    // buildings_lightweight/fetch_building_centers), so there's no
-    // outline to draw; a small marker stands in for it instead.
-    pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
-      radius: 5, color: "#00e5ff", weight: 2, fillColor: "#00e5ff", fillOpacity: 0.35,
-    }),
   }).addTo(map);
 
   document.getElementById("stat-fires").textContent = data.fires.features.length;
