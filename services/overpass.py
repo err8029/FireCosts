@@ -8,7 +8,10 @@ independently-operated public mirrors with separate rate limits. If the
 primary instance is throttled or down, this falls back to a second one
 instead of failing outright.
 """
+import math
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -79,3 +82,88 @@ def query(data, timeout=60):
     raise last_exc or requests.exceptions.Timeout(
         "Overpass query exceeded its time budget before any endpoint responded"
     )
+
+
+def _tile_bbox(bbox, max_tile_deg):
+    west, south, east, north = bbox
+    width, height = east - west, north - south
+    cols = max(1, math.ceil(width / max_tile_deg))
+    rows = max(1, math.ceil(height / max_tile_deg))
+    return [
+        (
+            west + i * width / cols, south + j * height / rows,
+            west + (i + 1) * width / cols, south + (j + 1) * height / rows,
+        )
+        for i in range(cols) for j in range(rows)
+    ]
+
+
+def fetch_tiled(bbox, fetch_tile, dedup_key, timeout, max_tile_deg=0.05, split_area_deg2=0.01):
+    """Fetch features covering bbox, splitting it into a grid of smaller
+    tiles and fetching them concurrently instead of one query over the
+    whole area, when bbox is bigger than split_area_deg2.
+
+    Used by buildings.py and landcover.py for the same reason: a single
+    Overpass query over a large burnt-area bbox both takes longer to
+    process server-side (more elements, more data to transfer) and is
+    all-or-nothing -- if it times out, everything is lost, whereas several
+    smaller concurrent queries are each individually lighter/faster *and*
+    let whichever ones succeed still count, rather than one slow tile
+    dragging the whole analysis down with it.
+
+    fetch_tile(tile_bbox) -> list of GeoJSON features for that tile;
+        should raise on failure (the same exception every tile will use).
+    dedup_key(feature) -> hashable key to de-duplicate features that
+        straddle two adjacent tiles -- Overpass's bbox filter matches any
+        way with at least one node inside, so such a feature comes back
+        (with full, undamaged geometry) from every tile it touches.
+
+    Returns (features, tiles_ok, tiles_total). When bbox needed splitting
+    (tiles_total > 1), this never raises itself -- if every tile fails,
+    tiles_ok is 0 and features is empty, and it's the caller's job to
+    decide whether that's an error worth surfacing (see buildings.py,
+    where zero successful tiles is treated as a hard failure but a
+    partial result is used as-is). When bbox fit in a single tile
+    (tiles_total == 1, the common case), there's no splitting to begin
+    with, so a failure propagates straight from fetch_tile as-is --
+    exactly like calling it directly.
+    """
+    tiles = [bbox] if _bbox_area_deg2(bbox) <= split_area_deg2 else _tile_bbox(bbox, max_tile_deg)
+
+    if len(tiles) == 1:
+        # No splitting to do -- behave exactly like a single plain fetch,
+        # including letting a failure propagate as-is (there's no
+        # "partial success" concept for exactly one tile, so the caller's
+        # own exception handling should see the real error, not a generic
+        # "0 tiles succeeded" swallowed down to nothing).
+        return fetch_tile(tiles[0]), 1, 1
+
+    pool = ThreadPoolExecutor(max_workers=min(len(tiles), 6))
+    futures = [pool.submit(fetch_tile, t) for t in tiles]
+    futures_wait(futures, timeout=timeout)
+
+    seen = set()
+    features = []
+    tiles_ok = 0
+    for fut in futures:
+        if not fut.done():
+            continue
+        try:
+            tile_features = fut.result()
+        except Exception:
+            continue
+        tiles_ok += 1
+        for feat in tile_features:
+            key = dedup_key(feat)
+            if key in seen:
+                continue
+            seen.add(key)
+            features.append(feat)
+    pool.shutdown(wait=False)
+
+    return features, tiles_ok, len(tiles)
+
+
+def _bbox_area_deg2(bbox):
+    west, south, east, north = bbox
+    return max(0.0, east - west) * max(0.0, north - south)

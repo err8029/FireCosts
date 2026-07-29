@@ -108,7 +108,7 @@ def _element_to_feature(el):
         return {
             "type": "Feature",
             "geometry": {"type": "Polygon", "coordinates": [coords]},
-            "properties": {"category": category, "name": tags.get("name")},
+            "properties": {"category": category, "name": tags.get("name"), "osm_id": el.get("id")},
         }
 
     if el.get("type") == "relation":
@@ -128,25 +128,14 @@ def _element_to_feature(el):
         return {
             "type": "Feature",
             "geometry": mapping(unary_union(polygons)),
-            "properties": {"category": category, "name": tags.get("name")},
+            "properties": {"category": category, "name": tags.get("name"), "osm_id": el.get("id")},
         }
 
     return None
 
 
-def fetch_vegetation(bbox, timeout=15):
-    """Fetch vegetation/land-cover polygons within bbox as a GeoJSON
-    FeatureCollection, each feature tagged with a "category" property (see
-    _CATEGORY_TAGS). Returns an empty FeatureCollection on any failure --
-    this is a supplementary estimate, not critical data.
-    """
-    if _bbox_area(bbox) > MAX_BBOX_DEG2:
-        raise LandcoverError(
-            "Selected area is too large for a live land-cover query. "
-            "Please zoom in / draw a smaller box."
-        )
-
-    west, south, east, north = bbox
+def _fetch_vegetation_tile(tile_bbox, timeout):
+    west, south, east, north = tile_bbox
     bbox_str = f"{south},{west},{north},{east}"
     filters = "".join(
         f'\n      way["{key}"="{value}"]({bbox_str});\n      relation["{key}"="{value}"]({bbox_str});'
@@ -159,17 +148,37 @@ def fetch_vegetation(bbox, timeout=15):
     );
     out geom;
     """
+    resp = overpass.query(query, timeout=timeout + 10)
+    data = resp.json()
+    return [f for f in (_element_to_feature(el) for el in data.get("elements", [])) if f]
+
+
+def fetch_vegetation(bbox, timeout=15):
+    """Fetch vegetation/land-cover polygons within bbox as a GeoJSON
+    FeatureCollection, each feature tagged with a "category" property (see
+    _CATEGORY_TAGS). Returns an empty FeatureCollection on any failure --
+    this is a supplementary estimate, not critical data.
+
+    Bigger than a small tile (see overpass.fetch_tiled), this splits into
+    a grid of concurrent smaller queries instead of one big one over the
+    whole area -- same reasoning as buildings.py: each tile is lighter/
+    faster for Overpass, and a tile that fails only costs that patch of
+    coverage instead of losing everything.
+    """
+    if _bbox_area(bbox) > MAX_BBOX_DEG2:
+        raise LandcoverError(
+            "Selected area is too large for a live land-cover query. "
+            "Please zoom in / draw a smaller box."
+        )
 
     try:
-        resp = overpass.query(query, timeout=timeout + 10)
-        data = resp.json()
+        features, _tiles_ok, _tiles_total = overpass.fetch_tiled(
+            bbox,
+            fetch_tile=lambda tile_bbox: _fetch_vegetation_tile(tile_bbox, timeout),
+            dedup_key=lambda feat: feat["properties"]["osm_id"],
+            timeout=timeout,
+        )
     except requests.RequestException:
         return {"type": "FeatureCollection", "features": []}
-
-    features = []
-    for el in data.get("elements", []):
-        feature = _element_to_feature(el)
-        if feature:
-            features.append(feature)
 
     return {"type": "FeatureCollection", "features": features}

@@ -58,7 +58,16 @@ def build_burnt_area(fire_geojson, source="VIIRS_SNPP_NRT", radius_m=None):
     return mapping(dissolved), area_km2
 
 
-def _scaled_buffer(pt, lon_radius_deg, lat_radius_deg, resolution=8):
+def _scaled_buffer(pt, lon_radius_deg, lat_radius_deg, resolution=4):
+    # resolution=4 (16 segments/circle) rather than shapely's default 8 (32
+    # segments): this is already documented as a coarse proxy, not a
+    # precise burn perimeter, and a large multi-day fire can mean
+    # thousands of these buffered per detection before being dissolved
+    # together -- halving each circle's vertex count meaningfully speeds
+    # up that union (and every polygon operation downstream: vegetation
+    # clipping, building-affected checks, the GeoJSON payload size sent to
+    # the frontend) without a visible difference at the scale this renders
+    # at.
     circle = pt.buffer(1.0, resolution=resolution)
     from shapely.affinity import scale
     return scale(circle, xfact=lon_radius_deg, yfact=lat_radius_deg, origin=pt)
