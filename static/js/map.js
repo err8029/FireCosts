@@ -82,6 +82,7 @@ const sidebarBackdrop = document.getElementById("sidebar-backdrop");
 const sidebarToggleBtn = document.getElementById("sidebar-toggle");
 const analyzeBtn = document.getElementById("analyze-btn");
 const drawBoxBtn = document.getElementById("draw-box-btn");
+const backToOverviewBtn = document.getElementById("back-to-overview-btn");
 const dateInput = document.getElementById("date-input");
 const daysInput = document.getElementById("days-input");
 const sourceInput = document.getElementById("source-input");
@@ -256,13 +257,14 @@ function applyBbox(bbox) {
   const [west, south, east, north] = bbox;
   currentBbox = bbox;
 
-  // The overview pointers were only ever a guide for where to draw --
-  // once the user has an actual area of interest, they'd just clutter
-  // the map (and can visually overlap the real per-detection fire
-  // markers Analyze renders inside this box).
+  // The overview pointers would just clutter the map once the user has
+  // an actual area of interest (and can visually overlap the real
+  // per-detection fire markers Analyze renders inside this box) -- but
+  // keep the layer itself around (just detached), not discarded, so
+  // "Back to overview" can show it again without re-fetching/re-
+  // geocoding everything from scratch.
   if (activeFiresOverviewLayer) {
     map.removeLayer(activeFiresOverviewLayer);
-    activeFiresOverviewLayer = null;
   }
 
   drawnItems.clearLayers();
@@ -272,6 +274,7 @@ function applyBbox(bbox) {
 
   analyzeBtn.disabled = false;
   setStatus("");
+  if (activeFiresOverviewLayer) backToOverviewBtn.classList.remove("hidden");
 }
 
 recentBoxesSelect.addEventListener("change", () => {
@@ -320,7 +323,6 @@ drawBoxBtn.addEventListener("click", () => {
 map.on(L.Draw.Event.CREATED, (e) => {
   if (activeFiresOverviewLayer) {
     map.removeLayer(activeFiresOverviewLayer);
-    activeFiresOverviewLayer = null;
   }
   drawnItems.clearLayers();
   const layer = e.layer;
@@ -334,6 +336,28 @@ map.on(L.Draw.Event.CREATED, (e) => {
   ];
   analyzeBtn.disabled = false;
   setStatus("");
+  if (activeFiresOverviewLayer) backToOverviewBtn.classList.remove("hidden");
+});
+
+backToOverviewBtn.addEventListener("click", () => {
+  drawnItems.clearLayers();
+  currentBbox = null;
+  analyzeBtn.disabled = true;
+  reportBtn.disabled = true;
+  valuationBtn.disabled = true;
+  clearResultLayers();
+  resultsEl.classList.add("hidden");
+  valuationResultsEl.classList.add("hidden");
+  lastAffectedBuildings = null;
+  lastAnalysis = null;
+  lastValuation = null;
+  setStatus("");
+  backToOverviewBtn.classList.add("hidden");
+
+  if (activeFiresOverviewLayer) {
+    activeFiresOverviewLayer.addTo(map);
+    map.fitBounds(activeFiresOverviewLayer.getBounds(), { padding: [40, 40], maxZoom: 9 });
+  }
 });
 
 function setStatus(msg, isError) {
@@ -402,6 +426,28 @@ function daysBetweenInclusive(startIso, endIso) {
   return Math.round((end - start) / 86400000) + 1;
 }
 
+// cluster.label starts undefined (not yet fetched -- see the "mouseover"
+// handler below, which fetches it lazily), then becomes a string or null
+// once /api/reverse-geocode resolves.
+function overviewPopupHtml(cluster) {
+  let dateText = "";
+  if (cluster.start_date && cluster.end_date && cluster.start_date !== cluster.end_date) {
+    dateText = `Detected ${cluster.start_date} → ${cluster.end_date}`;
+  } else if (cluster.start_date) {
+    dateText = `Detected ${cluster.start_date}`;
+  }
+  const nameText = cluster.label === undefined
+    ? (cluster._labelLoading ? "Loading location…" : "Unnamed area")
+    : (cluster.label || "Unnamed area");
+  return (
+    `<strong>${nameText}</strong><br>` +
+    `~${cluster.count} fire detection${cluster.count === 1 ? "" : "s"}` +
+    (cluster.max_frp ? `, up to ${cluster.max_frp.toFixed(1)} MW radiative power` : "") +
+    (dateText ? `<br>${dateText}` : "") +
+    `<br><em>Click to zoom in and suggest an analysis box here.</em>`
+  );
+}
+
 // Shown on first load, before the user has drawn any box: rough pointers
 // for where active fires currently are across Spain (e.g. one near
 // "Sierra Oeste"), fetched once from FIRMS via /api/active-fires-overview
@@ -420,31 +466,38 @@ async function loadActiveFiresOverview() {
     activeFiresOverviewLayer = L.layerGroup(
       data.clusters.map((cluster) => {
         const radius = Math.min(9, Math.max(6, Math.sqrt(cluster.count) * 2));
-        let dateText = "";
-        if (cluster.start_date && cluster.end_date && cluster.start_date !== cluster.end_date) {
-          dateText = `Detected ${cluster.start_date} → ${cluster.end_date}`;
-        } else if (cluster.start_date) {
-          dateText = `Detected ${cluster.start_date}`;
-        }
-        return L.circleMarker([cluster.lat, cluster.lon], {
+        const marker = L.circleMarker([cluster.lat, cluster.lon], {
           radius,
           color: "#ff3d00",
           weight: 2,
           fillColor: "#ff9f1c",
           fillOpacity: 0.55,
           dashArray: "3,3",
-        }).bindPopup(
-          `<strong>${cluster.label || "Unnamed area"}</strong><br>` +
-          `~${cluster.count} fire detection${cluster.count === 1 ? "" : "s"}` +
-          (cluster.max_frp ? `, up to ${cluster.max_frp.toFixed(1)} MW radiative power` : "") +
-          (dateText ? `<br>${dateText}` : "") +
-          `<br><em>Click to zoom in and suggest an analysis box here.</em>`
+        }).bindPopup(overviewPopupHtml(cluster));
+
+        marker
         // Shown on hover, not just on click -- clicking now takes the
         // action (zoom + suggest a box), so the user needs to see what a
         // pointer actually is *before* committing to that, not just
-        // after.
-        ).on("mouseover", (e) => e.target.openPopup())
-        .on("mouseout", (e) => e.target.closePopup())
+        // after. The place name itself is fetched lazily right here
+        // (not eagerly for every cluster before any of this ever
+        // showed up, see api_active_fires_overview's docstring) --
+        // most users never hover every single pointer, so this spends
+        // Nominatim's rate-limited quota only on the ones actually
+        // looked at.
+        .on("mouseover", () => {
+          marker.openPopup();
+          if (cluster.label === undefined && !cluster._labelLoading) {
+            cluster._labelLoading = true;
+            marker.setPopupContent(overviewPopupHtml(cluster));
+            fetch(`/api/reverse-geocode?lat=${cluster.lat}&lon=${cluster.lon}`)
+              .then((r) => r.json())
+              .then((geo) => { cluster.label = geo.label || null; })
+              .catch(() => { cluster.label = null; })
+              .finally(() => marker.setPopupContent(overviewPopupHtml(cluster)));
+          }
+        })
+        .on("mouseout", () => marker.closePopup())
         .on("click", () => {
           // Suggest a box sized to this fire's own detections (see
           // firms.cluster_fires' bbox padding) and zoom to it, same as
@@ -462,6 +515,8 @@ async function loadActiveFiresOverview() {
           }
           setStatus("Box suggested from this fire's detections — adjust if needed, then Analyze.");
         });
+
+        return marker;
       })
     ).addTo(map);
 

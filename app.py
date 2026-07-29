@@ -1,5 +1,6 @@
 import datetime as dt
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 
@@ -100,20 +101,30 @@ def api_fires():
 # request rather than needing firms.fetch_active_fires' own chunking.
 SPAIN_BBOX = (-9.5, 35.9, 4.6, 43.9)
 MAX_OVERVIEW_CLUSTERS = 15
-GEOCODE_DEADLINE_S = 12
+GEOCODE_DEADLINE_S = 8
 
 
 @app.route("/api/active-fires-overview")
 def api_active_fires_overview():
-    """Return a handful of rough {"lat","lon","label","count","max_frp"}
-    clusters for the active fires currently detected across Spain, so the
-    map can show the user roughly where to draw their analysis box before
-    they've picked an area -- e.g. one pointer near "Sierra Oeste" instead
-    of nothing until they already know where to look.
+    """Return a handful of rough {"lat","lon","count","max_frp","start_date",
+    "end_date","bbox"} clusters for the active fires currently detected
+    across Spain, so the map can show the user roughly where to draw their
+    analysis box before they've picked an area -- e.g. one pointer near
+    "Sierra Oeste" instead of nothing until they already know where to
+    look.
 
     Deliberately coarse and best-effort: this is a "here's roughly where
     to look" guide, not the precise per-fire data /api/fires and
     /api/estimate provide once the user has drawn a box.
+
+    Deliberately does *not* reverse-geocode a place name here -- that used
+    to run eagerly for every cluster before this ever returned, one
+    request at a time (Nominatim's usage policy caps it at 1/second), so
+    the very first thing a user saw was however long that took (up to
+    MAX_OVERVIEW_CLUSTERS seconds). See /api/reverse-geocode below: the
+    frontend fetches a label lazily, per marker, only when the user
+    actually hovers over it -- markers themselves show up as soon as
+    FIRMS responds, and most users never hover every single one.
     """
     start_date = request.args.get("start", dt.date.today().isoformat())
     day_range = int(request.args.get("days", 1))
@@ -125,28 +136,28 @@ def api_active_fires_overview():
         return jsonify({"error": str(exc)}), 502
 
     clusters = firms_service.cluster_fires(fires)[:MAX_OVERVIEW_CLUSTERS]
-
-    if clusters:
-        # Reverse-geocoding each cluster is its own rate-limited (see
-        # geocode.py) network call, run one at a time on a single worker
-        # (Nominatim's usage policy caps this at 1 request/second anyway,
-        # so extra workers wouldn't help). Each cluster gets its own
-        # future rather than one future for the whole list, so if the
-        # shared deadline is hit partway through, clusters already
-        # resolved keep their label instead of every cluster losing it
-        # just because a later one was slow -- same reasoning as the
-        # municipality/locator lookups in /api/report degrading
-        # individually rather than all-or-nothing.
-        pool = ThreadPoolExecutor(max_workers=1)
-        label_futures = [
-            pool.submit(geocode_service.reverse_geocode, c["lat"], c["lon"]) for c in clusters
-        ]
-        futures_wait(label_futures, timeout=GEOCODE_DEADLINE_S)
-        for cluster, future in zip(clusters, label_futures):
-            cluster["label"] = future.result() if future.done() else None
-        pool.shutdown(wait=False)
-
     return jsonify({"clusters": clusters})
+
+
+@app.route("/api/reverse-geocode")
+def api_reverse_geocode():
+    """Return {"label": str|None} for a single point -- used to lazily
+    label one active-fire pointer on hover (see api_active_fires_overview
+    above for why this isn't done eagerly for all of them up front).
+    """
+    try:
+        lat = float(request.args["lat"])
+        lon = float(request.args["lon"])
+    except (KeyError, ValueError):
+        return jsonify({"error": "'lat' and 'lon' query params are required numbers"}), 400
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(geocode_service.reverse_geocode, lat, lon)
+    futures_wait([future], timeout=GEOCODE_DEADLINE_S)
+    label = future.result() if future.done() else None
+    pool.shutdown(wait=False)
+
+    return jsonify({"label": label})
 
 
 @app.route("/api/buildings")
@@ -215,7 +226,14 @@ def api_estimate():
         # lookups in /api/report. Deliberately not using the executor as
         # a context manager, since `with` would block on shutdown()
         # waiting for a fetch we've already decided to give up on.
-        FETCH_DEADLINE_S = 30
+        #
+        # Overridable via env var: a hosting environment's outbound route
+        # to Overpass can genuinely be slower/more rate-limited than a
+        # home connection (e.g. observed slower + vegetation degrading to
+        # empty more often on Render's free tier than locally) -- letting
+        # this be tuned per-deployment avoids needing a code change/redeploy
+        # just to grant it more patience.
+        FETCH_DEADLINE_S = int(os.environ.get("ESTIMATE_FETCH_DEADLINE_S", 30))
         pool = ThreadPoolExecutor(max_workers=2)
         buildings_future = pool.submit(buildings_service.fetch_buildings, query_bbox)
         vegetation_future = pool.submit(landcover_service.fetch_vegetation, query_bbox)
@@ -369,8 +387,10 @@ def api_report():
     # even on a healthy connection. A 12s deadline meant the locator
     # inset (country/region minimap with a star on the analysis
     # location) was being silently abandoned on essentially every report,
-    # not just on a bad Overpass day.
-    LOOKUP_DEADLINE_S = 12
+    # not just on a bad Overpass day. Overridable via env var for the same
+    # reason as ESTIMATE_FETCH_DEADLINE_S above -- a slower hosting
+    # environment may need more room than a fixed constant can give it.
+    LOOKUP_DEADLINE_S = int(os.environ.get("REPORT_LOOKUP_DEADLINE_S", 25))
     pool = ThreadPoolExecutor(max_workers=4)
     municipalities_future = (
         pool.submit(municipalities_service.fetch_municipality_boundaries, municipality_bbox)

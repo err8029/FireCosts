@@ -71,6 +71,18 @@ body {
   white-space: nowrap;
 }
 
+#back-to-overview-btn {
+  background: #2a2f36;
+}
+
+#back-to-overview-btn:hover {
+  background: #343b44;
+}
+
+#back-to-overview-btn.hidden {
+  display: none;
+}
+
 #app-body {
   position: relative;
   flex: 1;
