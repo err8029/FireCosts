@@ -330,25 +330,38 @@ def api_estimate():
         # slow rather than fully unreachable, without pretending a longer
         # wait fixes a connection that was never going to succeed.
         FETCH_DEADLINE_S = int(os.environ.get("ESTIMATE_FETCH_DEADLINE_S", 80))
+        # Each tile's *own* Overpass request timeout is deliberately much
+        # shorter than the outer deadline above, not pinned to it --
+        # confirmed directly (via /api/debug/overpass-check) that a mirror
+        # which answers a single query fine in a few seconds can still
+        # time out under this app's own real load shortly after, which
+        # points at abandoned requests from a previous attempt still
+        # running in the background: pool.shutdown(wait=False) stops
+        # *this* process from waiting on a slow tile, but the underlying
+        # HTTP request keeps running for as long as its own timeout
+        # allows, still occupying one of Overpass's limited per-client
+        # concurrent slots. Passing the full FETCH_DEADLINE_S down as the
+        # per-tile timeout too meant an abandoned request could keep
+        # competing for that slot for nearly as long as the *outer* wait
+        # itself (plus overpass.query's own +10s pad) -- so a retry
+        # shortly after a timeout was competing with its own leftovers.
+        # A much shorter per-tile budget both frees a stuck tile's worker
+        # slot sooner (fitting more attempts through fetch_tiled's small
+        # worker pool within the same outer deadline) and lets an
+        # abandoned request die off quickly instead of lingering.
+        TILE_TIMEOUT_S = int(os.environ.get("ESTIMATE_TILE_TIMEOUT_S", 20))
         pool = ThreadPoolExecutor(max_workers=4)
-        # Both calls' own internal Overpass timeout is pinned to this same
-        # deadline explicitly -- their defaults used to disagree wildly
-        # (fetch_buildings: 60s, fetch_vegetation: 15s), so vegetation's
-        # *own* query could quietly give up and return empty well before
-        # the outer deadline here was ever reached, independent of how
-        # patient this deadline actually was.
-        #
         # In lightweight mode, vegetation isn't even attempted: unlike
         # buildings (Catastro supplies real area independent of OSM
         # geometry), vegetation's *only* source of area is the OSM
         # polygon itself, so there's no lighter version of that query --
         # and at this size it's very unlikely to finish in time anyway.
         if buildings_lightweight:
-            buildings_future = pool.submit(buildings_service.fetch_building_centers, query_bbox, timeout=FETCH_DEADLINE_S)
+            buildings_future = pool.submit(buildings_service.fetch_building_centers, query_bbox, timeout=TILE_TIMEOUT_S)
             vegetation_future = None
         else:
-            vegetation_future = pool.submit(landcover_service.fetch_vegetation, query_bbox, timeout=FETCH_DEADLINE_S)
-            buildings_future = pool.submit(buildings_service.fetch_buildings, query_bbox, timeout=FETCH_DEADLINE_S)
+            vegetation_future = pool.submit(landcover_service.fetch_vegetation, query_bbox, timeout=TILE_TIMEOUT_S)
+            buildings_future = pool.submit(buildings_service.fetch_buildings, query_bbox, timeout=TILE_TIMEOUT_S)
 
         futures_wait([f for f in (buildings_future, vegetation_future) if f is not None], timeout=FETCH_DEADLINE_S)
 
