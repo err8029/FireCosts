@@ -65,7 +65,21 @@ def _price_for_use(use, default_price):
     return default_price
 
 
+# Rough assumed footprint when a building has no real polygon to measure
+# -- happens when services.buildings.fetch_building_centers was used
+# (a burnt area too large for full OSM footprints, see app.py's
+# ESTIMATE_MAX_QUERY_BBOX_DEG2), so this only ever applies to the
+# no-Catastro-match fallback path for a building we only know the center
+# point of. A single-family Spanish home footprint is roughly in this
+# range; deliberately not trying to be more precise than that, since a
+# building this route can't resolve via Catastro at all is already an
+# edge case.
+_DEFAULT_FOOTPRINT_M2 = 150.0
+
+
 def _footprint_area_m2(geom, levels=1.0):
+    if geom.area <= 0:
+        return _DEFAULT_FOOTPRINT_M2 * levels
     lat = geom.centroid.y
     m_per_deg_lon = _M_PER_DEG_LAT * math.cos(math.radians(lat))
     return geom.area * _M_PER_DEG_LAT * m_per_deg_lon * levels

@@ -98,7 +98,7 @@ def _tile_bbox(bbox, max_tile_deg):
     ]
 
 
-def fetch_tiled(bbox, fetch_tile, dedup_key, timeout, max_tile_deg=0.05, split_area_deg2=0.01):
+def fetch_tiled(bbox, fetch_tile, dedup_key, timeout, max_tile_deg=0.05, split_area_deg2=0.01, max_workers=6):
     """Fetch features covering bbox, splitting it into a grid of smaller
     tiles and fetching them concurrently instead of one query over the
     whole area, when bbox is bigger than split_area_deg2.
@@ -117,6 +117,12 @@ def fetch_tiled(bbox, fetch_tile, dedup_key, timeout, max_tile_deg=0.05, split_a
         straddle two adjacent tiles -- Overpass's bbox filter matches any
         way with at least one node inside, so such a feature comes back
         (with full, undamaged geometry) from every tile it touches.
+    max_workers: how many tiles to fetch concurrently. A lighter per-tile
+        query (e.g. buildings.fetch_building_centers' `out center`, far
+        cheaper than resolving a full footprint) can afford more
+        concurrency than the default without a heavier one starting to
+        strain Overpass -- callers doing a lightweight fetch over a large
+        area should raise this.
 
     Returns (features, tiles_ok, tiles_total). When bbox needed splitting
     (tiles_total > 1), this never raises itself -- if every tile fails,
@@ -138,7 +144,7 @@ def fetch_tiled(bbox, fetch_tile, dedup_key, timeout, max_tile_deg=0.05, split_a
         # "0 tiles succeeded" swallowed down to nothing).
         return fetch_tile(tiles[0]), 1, 1
 
-    pool = ThreadPoolExecutor(max_workers=min(len(tiles), 6))
+    pool = ThreadPoolExecutor(max_workers=min(len(tiles), max_workers))
     futures = [pool.submit(fetch_tile, t) for t in tiles]
     futures_wait(futures, timeout=timeout)
 
