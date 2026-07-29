@@ -1,9 +1,11 @@
 import datetime as dt
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 
+import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request, Response
 from shapely.geometry import shape
@@ -16,6 +18,7 @@ from services import firms as firms_service
 from services import geocode as geocode_service
 from services import landcover as landcover_service
 from services import municipalities as municipalities_service
+from services import overpass as overpass_service
 from services import report as report_service
 from services import valuation as valuation_service
 
@@ -158,6 +161,41 @@ def api_reverse_geocode():
     pool.shutdown(wait=False)
 
     return jsonify({"label": label})
+
+
+@app.route("/api/debug/overpass-check")
+def api_debug_overpass_check():
+    """Diagnostic: attempt one tiny, real Overpass query and report
+    whether it succeeded and how long it took, from wherever this app is
+    actually running. Building/vegetation 502s can come from either a
+    genuine bug in our own request logic or Overpass simply being
+    unreachable from this host's network right now (e.g. a hosting
+    platform's shared IP range getting rate-limited/blocked -- a real,
+    documented failure mode independent of how well-behaved our own
+    requests are) -- this tells the two apart without needing shell
+    access to the host. Safe to leave in permanently: it's a single tiny
+    read-only query, not a real endpoint anything depends on.
+    """
+    query = '[out:json][timeout:10];way["building"](40.30,-4.50,40.301,-4.499);out center;'
+    results = []
+    for url in overpass_service._ENDPOINTS:
+        t0 = time.time()
+        try:
+            resp = requests.post(
+                url, data={"data": query}, headers=overpass_service._HEADERS, timeout=12,
+            )
+            resp.raise_for_status()
+            n_elements = len(resp.json().get("elements", []))
+            results.append({
+                "endpoint": url, "ok": True,
+                "elapsed_s": round(time.time() - t0, 2), "elements": n_elements,
+            })
+        except Exception as exc:
+            results.append({
+                "endpoint": url, "ok": False,
+                "elapsed_s": round(time.time() - t0, 2), "error": f"{type(exc).__name__}: {exc}",
+            })
+    return jsonify({"results": results})
 
 
 @app.route("/api/buildings")
