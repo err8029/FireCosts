@@ -232,11 +232,23 @@ def api_estimate():
         # home connection (e.g. observed slower + vegetation degrading to
         # empty more often on Render's free tier than locally) -- letting
         # this be tuned per-deployment avoids needing a code change/redeploy
-        # just to grant it more patience.
-        FETCH_DEADLINE_S = int(os.environ.get("ESTIMATE_FETCH_DEADLINE_S", 30))
-        pool = ThreadPoolExecutor(max_workers=2)
-        buildings_future = pool.submit(buildings_service.fetch_buildings, query_bbox)
-        vegetation_future = pool.submit(landcover_service.fetch_vegetation, query_bbox)
+        # just to grant it more patience. Raised from 30 to 45: repeated
+        # direct measurement against the live Overpass mirrors show a
+        # healthy response lands in 1-4s, but a bad one hangs for the
+        # *entire* budget before failing (not a slow-but-working case) --
+        # so this mainly buys a bit more room for a mirror that's merely
+        # slow rather than fully unreachable, without pretending a longer
+        # wait fixes a connection that was never going to succeed.
+        FETCH_DEADLINE_S = int(os.environ.get("ESTIMATE_FETCH_DEADLINE_S", 60))
+        pool = ThreadPoolExecutor(max_workers=4)
+        # Both calls' own internal Overpass timeout is pinned to this same
+        # deadline explicitly -- their defaults used to disagree wildly
+        # (fetch_buildings: 60s, fetch_vegetation: 15s), so vegetation's
+        # *own* query could quietly give up and return empty well before
+        # the outer deadline here was ever reached, independent of how
+        # patient this deadline actually was.
+        buildings_future = pool.submit(buildings_service.fetch_buildings, query_bbox, timeout=FETCH_DEADLINE_S)
+        vegetation_future = pool.submit(landcover_service.fetch_vegetation, query_bbox, timeout=FETCH_DEADLINE_S)
 
         futures_wait([buildings_future, vegetation_future], timeout=FETCH_DEADLINE_S)
 
@@ -391,7 +403,7 @@ def api_report():
     # reason as ESTIMATE_FETCH_DEADLINE_S above -- a slower hosting
     # environment may need more room than a fixed constant can give it.
     LOOKUP_DEADLINE_S = int(os.environ.get("REPORT_LOOKUP_DEADLINE_S", 25))
-    pool = ThreadPoolExecutor(max_workers=4)
+    pool = ThreadPoolExecutor(max_workers=2)
     municipalities_future = (
         pool.submit(municipalities_service.fetch_municipality_boundaries, municipality_bbox)
         if municipality_bbox else None
