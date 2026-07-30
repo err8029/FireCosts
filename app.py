@@ -664,7 +664,15 @@ def api_report():
                 [(point_by_key[k].y, point_by_key[k].x) for k in keys],
             )
             futures_wait([veg_future], timeout=LOOKUP_DEADLINE_S)
-            found_per_point = veg_future.result() if veg_future.done() else [None] * len(keys)
+            if veg_future.done():
+                try:
+                    found_per_point = veg_future.result()
+                except Exception:
+                    logger.warning("Vegetation municipality lookup failed for report", exc_info=True)
+                    found_per_point = [None] * len(keys)
+            else:
+                logger.warning("Vegetation municipality lookup timed out for report")
+                found_per_point = [None] * len(keys)
             veg_pool.shutdown(wait=False)
 
             for key, found in zip(keys, found_per_point):

@@ -16,7 +16,6 @@ import os
 import threading
 import time
 
-import requests
 from shapely.geometry import LineString, Point, mapping, shape
 from shapely.ops import polygonize, unary_union
 from shapely.prepared import prep
@@ -176,14 +175,24 @@ def fetch_municipality_boundaries(bbox, timeout=15):
     try:
         resp = overpass.query(query, timeout=timeout + 10)
         data = resp.json()
-    except requests.RequestException:
+        results = []
+        for el in data.get("elements", []):
+            boundary = _relation_to_boundary(el)
+            if boundary:
+                results.append(boundary)
+    except Exception:
+        # Not just requests.RequestException: an unreliable mirror can
+        # also return a 200 with a body that doesn't match the expected
+        # shape (confirmed elsewhere this same investigation -- see
+        # overpass.py's _ENDPOINTS comment for overpass.osm.ch returning
+        # clean-but-empty data). The parsing above trusts every element to
+        # have the tags/members a real admin boundary relation would, so a
+        # malformed one raises AttributeError/KeyError/TypeError, not a
+        # RequestException -- previously uncaught here, silently promised
+        # "on any failure" by this docstring but actually still able to
+        # blow up the caller (see app.py's /api/report, which doesn't wrap
+        # every one of its lookups this defensively either).
         return []
-
-    results = []
-    for el in data.get("elements", []):
-        boundary = _relation_to_boundary(el)
-        if boundary:
-            results.append(boundary)
 
     with _cache_lock:
         _boundaries_cache[key] = (time.time(), results)
@@ -236,17 +245,20 @@ def fetch_locator_context(bbox, timeout=15):
     try:
         resp = overpass.query(query, timeout=timeout + 15)
         data = resp.json()
-    except requests.RequestException:
+        country = None
+        region = None
+        for el in data.get("elements", []):
+            level = el.get("tags", {}).get("admin_level")
+            if level == "2" and country is None:
+                country = _relation_to_boundary(el)
+            elif level == "4" and region is None:
+                region = _relation_to_boundary(el)
+    except Exception:
+        # See fetch_municipality_boundaries above -- catching only
+        # requests.RequestException let a malformed-but-200 response's
+        # parsing failure escape uncaught, defeating the "returns None on
+        # any failure" this is documented to guarantee.
         return {"country": None, "region": None}
-
-    country = None
-    region = None
-    for el in data.get("elements", []):
-        level = el.get("tags", {}).get("admin_level")
-        if level == "2" and country is None:
-            country = _relation_to_boundary(el)
-        elif level == "4" and region is None:
-            region = _relation_to_boundary(el)
 
     result = {"country": country, "region": region}
     with _cache_lock:
@@ -322,33 +334,39 @@ def fetch_municipalities_for_points(points, timeout=15):
     try:
         resp = overpass.query(query, timeout=timeout + 15)
         data = resp.json()
-    except requests.RequestException:
+
+        candidates = []
+        for el in data.get("elements", []):
+            boundary = _relation_to_boundary(el)
+            if boundary:
+                candidates.append(boundary)
+
+        if candidates:
+            if len(candidates) == 1:
+                resolved = candidates[0]
+                for i, _lat, _lon, _key in to_fetch:
+                    results[i] = resolved
+            else:
+                # Local import: valuation imports nothing from this module, so
+                # this doesn't create a cycle -- see app.py/report.py, which
+                # already reach into valuation's municipality-matching helpers
+                # the same way.
+                from services import valuation as valuation_service
+
+                prepared_candidates = valuation_service._prepare_municipalities(candidates)
+                by_name = {c["name"]: c for c in candidates}
+                for i, lat, lon, _key in to_fetch:
+                    name = valuation_service.municipality_for_point(Point(lon, lat), prepared_candidates)
+                    if name:
+                        results[i] = by_name.get(name)
+    except Exception:
+        # See fetch_municipality_boundaries above for why this is broader
+        # than requests.RequestException. Matters most here specifically:
+        # app.py's /api/report calls this one's future.result() with no
+        # try/except of its own (unlike its other two Overpass lookups),
+        # so an uncaught parsing failure from here doesn't just lose the
+        # vegetation municipality labels -- it 500s the whole report.
         return results
-
-    candidates = []
-    for el in data.get("elements", []):
-        boundary = _relation_to_boundary(el)
-        if boundary:
-            candidates.append(boundary)
-
-    if candidates:
-        if len(candidates) == 1:
-            resolved = candidates[0]
-            for i, _lat, _lon, _key in to_fetch:
-                results[i] = resolved
-        else:
-            # Local import: valuation imports nothing from this module, so
-            # this doesn't create a cycle -- see app.py/report.py, which
-            # already reach into valuation's municipality-matching helpers
-            # the same way.
-            from services import valuation as valuation_service
-
-            prepared_candidates = valuation_service._prepare_municipalities(candidates)
-            by_name = {c["name"]: c for c in candidates}
-            for i, lat, lon, _key in to_fetch:
-                name = valuation_service.municipality_for_point(Point(lon, lat), prepared_candidates)
-                if name:
-                    results[i] = by_name.get(name)
 
     with _cache_lock:
         for i, _lat, _lon, key in to_fetch:
