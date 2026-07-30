@@ -17,20 +17,24 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# overpass.kumi.systems listed first, not overpass-api.de (the more
-# commonly-cited "reference" instance): confirmed directly, from this
-# app's actual Render deployment, that overpass-api.de fails instantly
-# with "Network is unreachable" (a routing-level rejection, not a slow
-# response) while kumi.systems answers a real query fine in ~3.5s.
-# Consistently the more reliable of the two across this project's
-# development (also true from the developer's own network at various
-# points this session) -- trying it first means every query stops wasting
-# its first attempt (and, under services/overpass.py's split time budget,
-# a meaningful chunk of that query's total patience) on an endpoint that's
-# been reliably dead for this app specifically.
+# overpass-api.de and overpass.kumi.systems -- the two more commonly-cited
+# "main" public instances -- were both confirmed, via this app's own
+# /api/debug/overpass-check run repeatedly against the real Render
+# deployment, to have become consistently unreachable/unresponsive from
+# this host: overpass-api.de fails instantly with "Network is unreachable"
+# (a routing-level rejection every single time, not a slow response), and
+# kumi.systems now times out (~12-16s) rather than the ~3.5-7s it managed
+# earlier in this project's development. Neither recovered across several
+# checks spread over time, so this isn't a transient blip worth waiting
+# out. Replaced with two mirrors the same diagnostic endpoint confirmed
+# actually work from this deployment right now: overpass.osm.ch answered
+# in under a second, maps.mail.ru in ~12s (slower, but a real success,
+# kept as the fallback). If these two also go quiet later, re-run
+# /api/debug/overpass-check (it tests a wider candidate list than just
+# what's configured here) before guessing at a replacement again.
 _ENDPOINTS = [
-    "https://overpass.kumi.systems/api/interpreter",
-    "https://overpass-api.de/api/interpreter",
+    "https://overpass.osm.ch/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 _HEADERS = {"User-Agent": "Hephaestus/1.0 (personal project; contact: n/a)"}
 
