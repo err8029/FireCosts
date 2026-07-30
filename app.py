@@ -163,38 +163,69 @@ def api_reverse_geocode():
     return jsonify({"label": label})
 
 
+# Wider set of public Overpass instances than the 2 actually configured
+# in services/overpass.py._ENDPOINTS -- both of those have been
+# confirmed, repeatedly, either unreachable (overpass-api.de) or timing
+# out (kumi.systems) from this app's Render deployment. Tested here, not
+# added straight to production, so there's real data on which (if any)
+# are reachable from this specific host before trusting one with real
+# traffic -- an untested mirror could just as easily be dead too, or
+# behave differently enough (rate limits, query size limits) to cause new
+# problems instead of fixing this one.
+_DEBUG_CANDIDATE_ENDPOINTS = [
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass.osm.ch/api/interpreter",
+    "https://overpass.nchc.org.tw/api/interpreter",
+]
+
+
 @app.route("/api/debug/overpass-check")
 def api_debug_overpass_check():
-    """Diagnostic: attempt one tiny, real Overpass query and report
-    whether it succeeded and how long it took, from wherever this app is
-    actually running. Building/vegetation 502s can come from either a
-    genuine bug in our own request logic or Overpass simply being
-    unreachable from this host's network right now (e.g. a hosting
+    """Diagnostic: attempt one tiny, real Overpass query against a wide
+    set of public instances (not just the 2 actually configured in
+    services/overpass.py) and report which succeeded, from wherever this
+    app is actually running. Building/vegetation 502s can come from
+    either a genuine bug in our own request logic or Overpass simply
+    being unreachable from this host's network right now (e.g. a hosting
     platform's shared IP range getting rate-limited/blocked -- a real,
     documented failure mode independent of how well-behaved our own
     requests are) -- this tells the two apart without needing shell
-    access to the host. Safe to leave in permanently: it's a single tiny
-    read-only query, not a real endpoint anything depends on.
+    access to the host, and surfaces a working alternative mirror if the
+    two currently configured ones are both having a bad day. Safe to
+    leave in permanently: tiny, read-only, run once per request. Fired
+    concurrently, not one at a time, so testing 7 candidates doesn't take
+    7x as long.
     """
     query = '[out:json][timeout:10];way["building"](40.30,-4.50,40.301,-4.499);out center;'
-    results = []
-    for url in overpass_service._ENDPOINTS:
+
+    def _check_one(url):
         t0 = time.time()
         try:
             resp = requests.post(
-                url, data={"data": query}, headers=overpass_service._HEADERS, timeout=12,
+                url, data={"data": query}, headers=overpass_service._HEADERS, timeout=15,
             )
             resp.raise_for_status()
             n_elements = len(resp.json().get("elements", []))
-            results.append({
+            return {
                 "endpoint": url, "ok": True,
                 "elapsed_s": round(time.time() - t0, 2), "elements": n_elements,
-            })
+            }
         except Exception as exc:
-            results.append({
+            return {
                 "endpoint": url, "ok": False,
                 "elapsed_s": round(time.time() - t0, 2), "error": f"{type(exc).__name__}: {exc}",
-            })
+            }
+
+    pool = ThreadPoolExecutor(max_workers=len(_DEBUG_CANDIDATE_ENDPOINTS))
+    futures = [pool.submit(_check_one, url) for url in _DEBUG_CANDIDATE_ENDPOINTS]
+    futures_wait(futures, timeout=20)
+    results = [f.result() if f.done() else {"ok": False, "error": "did not finish within 20s"} for f in futures]
+    pool.shutdown(wait=False)
+
     return jsonify({"results": results})
 
 
