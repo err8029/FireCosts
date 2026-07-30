@@ -93,11 +93,38 @@ def query(data, timeout=60):
     )
 
 
-def _tile_bbox(bbox, max_tile_deg):
+def _tile_bbox(bbox, max_tile_deg, max_tiles=12):
     west, south, east, north = bbox
     width, height = east - west, north - south
     cols = max(1, math.ceil(width / max_tile_deg))
     rows = max(1, math.ceil(height / max_tile_deg))
+
+    if cols * rows > max_tiles:
+        # A fixed tile size doesn't scale with how large the caller's
+        # allowed query area is -- tile *count* (not just per-tile cost)
+        # grows without bound as the area grows, and confirmed directly
+        # that this actually happened: raising app.py's
+        # ESTIMATE_MAX_QUERY_BBOX_KM2 let a real ~1826km2 fire through,
+        # which produced 168 tiles at the fixed 0.05deg size -- with only
+        # a handful of worker slots and a per-tile timeout, only a small
+        # fraction of those could realistically finish within the outer
+        # deadline, so almost all the real buildings there were silently
+        # dropped (776 -> 6 in one reported case) even though fetch_tiled
+        # was "working" exactly as designed for a smaller area. Scaling
+        # the tile size up (fewer, bigger tiles) here keeps the total
+        # count bounded regardless of the query area, preserving the
+        # bbox's aspect ratio.
+        scale = math.sqrt((cols * rows) / max_tiles)
+        cols = max(1, math.ceil(cols / scale))
+        rows = max(1, math.ceil(rows / scale))
+        while cols * rows > max_tiles and (cols > 1 or rows > 1):
+            if cols >= rows and cols > 1:
+                cols -= 1
+            elif rows > 1:
+                rows -= 1
+            else:
+                break
+
     return [
         (
             west + i * width / cols, south + j * height / rows,
@@ -107,7 +134,7 @@ def _tile_bbox(bbox, max_tile_deg):
     ]
 
 
-def fetch_tiled(bbox, fetch_tile, dedup_key, timeout, max_tile_deg=0.05, split_area_deg2=0.01, max_workers=3):
+def fetch_tiled(bbox, fetch_tile, dedup_key, timeout, max_tile_deg=0.05, split_area_deg2=0.01, max_workers=3, max_tiles=12):
     """Fetch features covering bbox, splitting it into a grid of smaller
     tiles and fetching them concurrently instead of one query over the
     whole area, when bbox is bigger than split_area_deg2.
@@ -138,6 +165,18 @@ def fetch_tiled(bbox, fetch_tile, dedup_key, timeout, max_tile_deg=0.05, split_a
         down" from the caller's side even though a single request would
         have worked. A lighter per-tile query doesn't change this -- the
         constraint is connection count, not query weight.
+    max_tiles: hard cap on how many tiles a bbox ever gets split into --
+        _tile_bbox grows the tile size (fewer, bigger tiles) rather than
+        letting count grow unbounded as bbox gets bigger, so this stays
+        the real throughput limit regardless of area: with max_workers
+        workers and a caller-side per-tile timeout T, the worst case is
+        ceil(max_tiles / max_workers) * T. Keep this consistent with
+        whatever outer deadline the caller waits on overall -- confirmed
+        directly that leaving tile *size* fixed while letting a caller
+        raise its own area cap silently dropped almost all results (a
+        real ~1826km2 area produced 168 tiles at a fixed 5km tile size,
+        of which only a handful could ever finish within an 80s outer
+        wait at 3 workers).
 
     Returns (features, tiles_ok, tiles_total). When bbox needed splitting
     (tiles_total > 1), this never raises itself -- if every tile fails,
@@ -149,7 +188,7 @@ def fetch_tiled(bbox, fetch_tile, dedup_key, timeout, max_tile_deg=0.05, split_a
     with, so a failure propagates straight from fetch_tile as-is --
     exactly like calling it directly.
     """
-    tiles = [bbox] if _bbox_area_deg2(bbox) <= split_area_deg2 else _tile_bbox(bbox, max_tile_deg)
+    tiles = [bbox] if _bbox_area_deg2(bbox) <= split_area_deg2 else _tile_bbox(bbox, max_tile_deg, max_tiles)
 
     if len(tiles) == 1:
         # No splitting to do -- behave exactly like a single plain fetch,
