@@ -185,22 +185,45 @@ _DEBUG_CANDIDATE_ENDPOINTS = [
 
 @app.route("/api/debug/overpass-check")
 def api_debug_overpass_check():
-    """Diagnostic: attempt one tiny, real Overpass query against a wide
-    set of public instances (not just the 2 actually configured in
-    services/overpass.py) and report which succeeded, from wherever this
-    app is actually running. Building/vegetation 502s can come from
-    either a genuine bug in our own request logic or Overpass simply
-    being unreachable from this host's network right now (e.g. a hosting
-    platform's shared IP range getting rate-limited/blocked -- a real,
-    documented failure mode independent of how well-behaved our own
-    requests are) -- this tells the two apart without needing shell
-    access to the host, and surfaces a working alternative mirror if the
-    two currently configured ones are both having a bad day. Safe to
-    leave in permanently: tiny, read-only, run once per request. Fired
-    concurrently, not one at a time, so testing 7 candidates doesn't take
-    7x as long.
+    """Diagnostic: attempt one real Overpass query -- for a bbox known to
+    have hundreds of real buildings (central Madrid), not just any bbox --
+    against a wide set of public instances (not just the 1 actually
+    configured in services/overpass.py) and report which both responded
+    *and* returned plausible data, from wherever this app is actually
+    running.
+
+    Checking data, not just reachability, matters: confirmed directly
+    that overpass.osm.ch answered this exact kind of check fast and
+    cleanly (HTTP 200, valid JSON) while actually carrying none of
+    Spain's OSM data at all -- a mirror that's technically "up" but
+    silently wrong is worse than one that's honestly unreachable, since a
+    clean failure at least triggers this app's existing fallback/retry
+    handling, where a confident empty answer doesn't. An earlier version
+    of this check used a near-empty rural bbox, where 0 results looks
+    identical whether the mirror has no data or the area just has nothing
+    in it -- that's exactly how the osm.ch problem went undetected at
+    first. "ok" here means "responded AND found a plausible number of
+    buildings", not just "responded".
+
+    Safe to leave in permanently: read-only, run once per request. Fired
+    concurrently, not one at a time, so testing several candidates
+    doesn't take that many times as long.
     """
-    query = '[out:json][timeout:10];way["building"](40.30,-4.50,40.301,-4.499);out center;'
+    # Central Madrid, ~500m x 500m -- verified directly to contain ~480
+    # real building ways; expect at least a low hundred elements back if
+    # a mirror actually has real, current Spain coverage.
+    bbox_str = "40.415,-3.705,40.420,-3.700"
+    query = f"""
+    [out:json][timeout:15];
+    (
+      way["building"]({bbox_str});
+      relation["building"]({bbox_str});
+    );
+    out body;
+    >;
+    out skel qt;
+    """
+    MIN_PLAUSIBLE_ELEMENTS = 100
 
     def _check_one(url):
         t0 = time.time()
@@ -210,9 +233,15 @@ def api_debug_overpass_check():
             )
             resp.raise_for_status()
             n_elements = len(resp.json().get("elements", []))
+            plausible = n_elements >= MIN_PLAUSIBLE_ELEMENTS
             return {
-                "endpoint": url, "ok": True,
+                "endpoint": url, "ok": plausible,
                 "elapsed_s": round(time.time() - t0, 2), "elements": n_elements,
+                **({} if plausible else {
+                    "warning": f"responded but found only {n_elements} elements -- "
+                               f"expected >= {MIN_PLAUSIBLE_ELEMENTS} for this real bbox, "
+                               "likely missing/partial data coverage rather than a real failure",
+                }),
             }
         except Exception as exc:
             return {

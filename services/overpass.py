@@ -26,14 +26,30 @@ from urllib3.util.retry import Retry
 # kumi.systems now times out (~12-16s) rather than the ~3.5-7s it managed
 # earlier in this project's development. Neither recovered across several
 # checks spread over time, so this isn't a transient blip worth waiting
-# out. Replaced with two mirrors the same diagnostic endpoint confirmed
-# actually work from this deployment right now: overpass.osm.ch answered
-# in under a second, maps.mail.ru in ~12s (slower, but a real success,
-# kept as the fallback). If these two also go quiet later, re-run
-# /api/debug/overpass-check (it tests a wider candidate list than just
-# what's configured here) before guessing at a replacement again.
+# out.
+#
+# overpass.osm.ch was tried as a replacement next -- it answers fast
+# (<1s) -- but confirmed directly (querying central Madrid, one of the
+# most densely-mapped areas in Spain) that it returns a clean, valid,
+# *empty* response: 0 nodes/ways/relations, for real data that
+# definitely exists. It isn't down or slow, it just doesn't carry Spain's
+# data at all (likely a regional/partial mirror despite having no stated
+# scope) -- and because it answers with a normal 200 instead of an error,
+# our code has no way to tell that apart from "genuinely no buildings
+# here", which is worse than a mirror that's honestly unreachable: a
+# clean failure at least triggers the existing fallback/retry handling,
+# where a confidently-wrong empty answer doesn't. Deliberately excluded
+# from _ENDPOINTS for that reason even though it's fast.
+#
+# maps.mail.ru is the only mirror so far confirmed both reachable *and*
+# carrying real, current Spain data (verified directly: 484 real building
+# ways for the same Madrid bbox, current OSM timestamp) -- kept as the
+# sole endpoint for now rather than pairing it with something merely fast.
+# If it also goes quiet later, re-run /api/debug/overpass-check (tests a
+# wider candidate list than just what's configured here) and verify any
+# new candidate actually returns real data for a known area before adding
+# it here, not just that it answers.
 _ENDPOINTS = [
-    "https://overpass.osm.ch/api/interpreter",
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 _HEADERS = {"User-Agent": "Hephaestus/1.0 (personal project; contact: n/a)"}
